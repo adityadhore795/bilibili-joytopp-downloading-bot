@@ -38,7 +38,6 @@ except dropbox.exceptions.ApiError:
     dbx.files_create_folder_v2(dropbox_folder)
 
 # --- 3. Download latest video(s) from Bilibili ---
-print("Downloading videos from Bilibili...")
 download_cmd = [
     "yt-dlp",
     "--no-warnings",
@@ -46,10 +45,8 @@ download_cmd = [
     "-o", "%(title)s.%(ext)s",
     "--max-downloads", "1",
     "--playlist-end", "1",
-    BILIBILI_CHANNEL_URL
+    "https://space.bilibili.com/87877349/video"
 ]
-# Get filenames first
-filenames = subprocess.check_output(download_cmd, text=True).splitlines()
 
 # Now download
 subprocess.run(
@@ -58,7 +55,7 @@ subprocess.run(
         "-o", "%(title)s.%(ext)s",
         "--max-downloads", str(max_videos),
         "--playlist-end", str(max_videos),
-        channel_url,
+        "https://space.bilibili.com/87877349/video"
     ],
     check=True,
 )
