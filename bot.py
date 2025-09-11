@@ -12,6 +12,7 @@ dropbox_folder = "/joytopp"
 APP_KEY = os.getenv("DROPBOX_APP_KEY")
 APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+BILIBILI_CHANNEL_URL = "https://space.bilibili.com/87877349/video"
 
 # --- 1. Get short-lived access token from refresh token ---
 resp = requests.post(
