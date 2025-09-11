@@ -10,7 +10,7 @@ REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 BILIBILI_CHANNEL_URL = "https://space.bilibili.com/87877349/video"
 
 # --- Config ---
-channel_url = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
+channel_url = "https://space.bilibili.com/87877349/video"
 max_videos = int(os.getenv("BILIBILI_MAX_VIDEOS", "1"))
 dropbox_folder = "/joytopp"
 
