@@ -42,10 +42,9 @@ download_cmd = [
     "--no-warnings",
     "--get-filename",
     "-o", "%(title)s.%(ext)s",
-    "--max-downloads", str(max_videos),
-    "--dateafter", "0",  # no date limit, we just want latest
-    "--playlist-end", str(max_videos),
-    channel_url,
+    "--max-downloads", "1",
+    "--playlist-end", "1",
+    BILIBILI_CHANNEL_URL
 ]
 # Get filenames first
 filenames = subprocess.check_output(download_cmd, text=True).splitlines()
