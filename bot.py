@@ -5,14 +5,14 @@ import dropbox
 import requests
 
 # --- Config ---
-channel_url = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349")
+channel_url = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
 max_videos = int(os.getenv("BILIBILI_MAX_VIDEOS", "1"))
 dropbox_folder = "/joytopp"
 
 APP_KEY = os.getenv("DROPBOX_APP_KEY")
 APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
-BILIBILI_CHANNEL_URL = "https://space.bilibili.com/87877349"
+BILIBILI_CHANNEL_URL = "https://space.bilibili.com/87877349/video"
 
 # --- 1. Get short-lived access token from refresh token ---
 resp = requests.post(
