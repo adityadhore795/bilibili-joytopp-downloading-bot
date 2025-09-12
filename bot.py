@@ -42,27 +42,61 @@ print("Downloading videos from Bilibili...")
 
 download_cmd = [
     "yt-dlp",
+    "--no-warnings",
+    "--no-progress",
     "-o", "%(title)s.%(ext)s",
     "--max-downloads", str(max_videos),
     "--playlist-end", str(max_videos),
     "--print", "after_move:filepath",
-    "https://space.bilibili.com/87877349/video"
+    "https://space.bilibili.com/87877349/video",
 ]
 
-# Run yt-dlp and capture filenames, but don’t crash on exit 101
-proc = subprocess.run(
-    download_cmd,
-    text=True,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT
-)
+# Run yt-dlp and capture stdout/stderr (do NOT merge stderr into stdout)
+proc = subprocess.run(download_cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-filenames = proc.stdout.strip().splitlines()
+stdout = proc.stdout.strip()
+stderr = proc.stderr.strip()
+if stderr:
+    # show but do not treat as filename
+    print("yt-dlp stderr (warnings/info):")
+    print(stderr)
+
+# Parse candidate lines from stdout and keep only real files
+candidates = [line.strip() for line in stdout.splitlines() if line.strip()]
+
+# known media extensions we care about
+MEDIA_EXTS = (".mp4", ".mkv", ".m4a", ".webm", ".flv", ".ts", ".mov", ".avi", ".mp3", ".aac")
+
+filenames = []
+cwd = os.getcwd()
+for line in candidates:
+    # 1) if the line is an absolute path and exists
+    if os.path.isabs(line) and os.path.exists(line):
+        filenames.append(line)
+        continue
+    # 2) if it looks like a media filename, try relative path in cwd
+    if any(line.endswith(ext) for ext in MEDIA_EXTS):
+        possible = os.path.join(cwd, line) if not os.path.isabs(line) else line
+        if os.path.exists(possible):
+            filenames.append(possible)
+            continue
+
+# 3) fallback: if nothing found, look for recent media files in working dir
+if not filenames:
+    all_media = [f for f in os.listdir(cwd) if f.lower().endswith(MEDIA_EXTS)]
+    # sort by modification time (most recent first)
+    all_media.sort(key=lambda p: os.path.getmtime(os.path.join(cwd, p)), reverse=True)
+    filenames = [os.path.join(cwd, f) for f in all_media[:max_videos]]
 
 if not filenames:
-    raise RuntimeError("No filenames captured from yt-dlp output")
+    raise RuntimeError(
+        "No downloaded files found. yt-dlp stdout:\n"
+        + stdout[:2000]
+        + "\n\nyt-dlp stderr:\n"
+        + stderr[:2000]
+    )
 
-print(f"Downloaded files: {filenames}")
+print("Downloaded files:", filenames)
 
 # Now download
 subprocess.run(
