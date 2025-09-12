@@ -57,7 +57,7 @@ subprocess.run(
         "--playlist-end", str(max_videos),
         "https://space.bilibili.com/87877349/video"
     ],
-    check=True,
+    check=False,   # don’t crash on yt-dlp exit 101
 )
 
 # --- 4. Upload to Dropbox ---
