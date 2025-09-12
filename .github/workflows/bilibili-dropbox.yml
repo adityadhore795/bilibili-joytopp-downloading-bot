@@ -23,7 +23,8 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ffmpeg git
           python -m pip install --upgrade pip
-          pip install yt-dlp dropbox requests
+          pip install yt-dlp dropbox requests googletrans==4.0.0-rc1
+
 
       - name: Run bot
         env:
