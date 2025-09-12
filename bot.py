@@ -114,6 +114,6 @@ subprocess.run(
 print("Uploading to Dropbox...")
 for fname in filenames:
     path = f"{dropbox_folder}/{os.path.basename(fname)}"
-    with open(fname, "rb") as f:
+    with open(os.path.abspath(fname), "rb") as f:
         dbx.files_upload(f.read(), path, mode=dropbox.files.WriteMode.overwrite)
     print(f"Uploaded {fname} → {path}")
