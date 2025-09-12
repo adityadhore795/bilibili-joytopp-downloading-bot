@@ -110,10 +110,30 @@ subprocess.run(
     check=False,   # don’t crash on yt-dlp exit 101
 )
 
-# --- 4. Upload to Dropbox ---
+# --- 4. Upload to Dropbox (supports large files) ---
 print("Uploading to Dropbox...")
+
+CHUNK_SIZE = 50 * 1024 * 1024  # 50 MB chunks (safe for Dropbox API)
+
 for fname in filenames:
     path = f"{dropbox_folder}/{os.path.basename(fname)}"
-    with open(os.path.abspath(fname), "rb") as f:
-        dbx.files_upload(f.read(), path, mode=dropbox.files.WriteMode.overwrite)
-    print(f"Uploaded {fname} → {path}")
+    file_size = os.path.getsize(fname)
+
+    with open(fname, "rb") as f:
+        if file_size <= 150 * 1024 * 1024:  # small file → normal upload
+            dbx.files_upload(f.read(), path, mode=dropbox.files.WriteMode.overwrite)
+            print(f"Uploaded {fname} → {path}")
+        else:
+            print(f"{fname} is large ({file_size/1024/1024:.2f} MB), using chunked upload...")
+            upload_session_start_result = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
+            cursor = dropbox.files.UploadSessionCursor(session_id=upload_session_start_result.session_id, offset=f.tell())
+            commit = dropbox.files.CommitInfo(path=path, mode=dropbox.files.WriteMode.overwrite)
+
+            while f.tell() < file_size:
+                if (file_size - f.tell()) <= CHUNK_SIZE:
+                    dbx.files_upload_session_finish(f.read(CHUNK_SIZE), cursor, commit)
+                else:
+                    dbx.files_upload_session_append_v2(f.read(CHUNK_SIZE), cursor)
+                    cursor.offset = f.tell()
+
+            print(f"Uploaded {fname} → {path}")
