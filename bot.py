@@ -40,18 +40,29 @@ except dropbox.exceptions.ApiError:
 # --- 3. Download latest video(s) from Bilibili ---
 print("Downloading videos from Bilibili...")
 
-# Download and capture output filenames directly
 download_cmd = [
     "yt-dlp",
     "-o", "%(title)s.%(ext)s",
     "--max-downloads", str(max_videos),
     "--playlist-end", str(max_videos),
-    "--print", "after_move:filepath",   # print the saved file path(s)
+    "--print", "after_move:filepath",
     "https://space.bilibili.com/87877349/video"
 ]
 
-filenames = subprocess.check_output(download_cmd, text=True).splitlines()
+# Run yt-dlp and capture filenames, but don’t crash on exit 101
+proc = subprocess.run(
+    download_cmd,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT
+)
 
+filenames = proc.stdout.strip().splitlines()
+
+if not filenames:
+    raise RuntimeError("No filenames captured from yt-dlp output")
+
+print(f"Downloaded files: {filenames}")
 
 # Now download
 subprocess.run(
