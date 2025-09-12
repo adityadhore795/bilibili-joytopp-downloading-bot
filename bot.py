@@ -195,50 +195,53 @@ def main():
     downloaded_ids = load_downloaded_ids(DOWNLOADED_IDS_PATH)
     print(f"Loaded {len(downloaded_ids)} previously downloaded IDs")
 
-    # Fetch playlist metadata (JSON per entry)
-    meta_cmd = [
-        "yt-dlp",
-        "-j",  # JSON per entry
-        "--skip-download",
-        "--playlist-end", str(MAX_VIDEOS),
-        BILIBILI_CHANNEL_URL,
-    ]
-    print("Fetching metadata from Bilibili...")
-    proc = subprocess.run(meta_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.stderr:
-        print("yt-dlp stderr (info/warnings):")
-        print(proc.stderr.strip()[:2000])
+   # Fetch playlist metadata (JSON per entry)
+meta_cmd = [
+    "yt-dlp",
+    "-j",  # JSON per entry
+    "--skip-download",
+    "--playlist-end", "9999",   # fetch all videos from channel
+    BILIBILI_CHANNEL_URL,
+]
+print("Fetching metadata from Bilibili...")
+proc = subprocess.run(meta_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+if proc.stderr:
+    print("yt-dlp stderr (info/warnings):")
+    print(proc.stderr.strip()[:2000])
 
-    entries = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            entries.append(obj)
-        except Exception:
-            continue
+entries = []
+for line in proc.stdout.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+        entries.append(obj)
+    except Exception:
+        continue
 
-    if not entries:
-        print("No playlist entries found. Exiting.")
-        return
+if not entries:
+    print("No playlist entries found. Exiting.")
+    return
 
-    # Build list of videos to process (skip downloaded)
-    to_process = []
-    for entry in entries:
-        vid = entry.get("id") or entry.get("webpage_url") or entry.get("url")
-        if not vid:
-            print("Skipping entry without id/url")
-            continue
-        if vid in downloaded_ids:
-            print(f"Skipping already-downloaded video: {vid} / {entry.get('title')}")
-            continue
-        to_process.append((vid, entry))
+# Build list of videos to process (skip downloaded)
+to_process = []
+for entry in entries:
+    vid = entry.get("id") or entry.get("webpage_url") or entry.get("url")
+    if not vid:
+        print("Skipping entry without id/url")
+        continue
+    if vid in downloaded_ids:
+        print(f"Skipping already-downloaded video: {vid} / {entry.get('title')}")
+        continue
+    to_process.append((vid, entry))
 
-    if not to_process:
-        print("No new videos to download.")
-        return
+# Cap the number of new downloads per run
+to_process = to_process[:MAX_VIDEOS]
+
+if not to_process:
+    print("No new videos to download.")
+    return
 
     # Process each new video
     for vid, entry in to_process:
