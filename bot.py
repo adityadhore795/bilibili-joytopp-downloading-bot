@@ -222,7 +222,7 @@ for line in proc.stdout.splitlines():
 
 if not entries:
     print("No playlist entries found. Exiting.")
-    return
+    exit(0)
 
 # Build list of videos to process (skip downloaded)
 to_process = []
@@ -241,7 +241,7 @@ to_process = to_process[:MAX_VIDEOS]
 
 if not to_process:
     print("No new videos to download.")
-    return
+    exit(0)
 
     # Process each new video
     for vid, entry in to_process:
