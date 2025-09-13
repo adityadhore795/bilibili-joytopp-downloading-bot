@@ -196,50 +196,31 @@ def main():
     print(f"Loaded {len(downloaded_ids)} previously downloaded IDs")
 
    # Fetch playlist metadata (JSON per entry)
-meta_cmd = [
-    "yt-dlp",
-    "-j",  # JSON per entry
-    "--skip-download",
-    "--playlist-end", "9999",   # fetch all videos from channel
-    BILIBILI_CHANNEL_URL,
-]
+# --- Fetch playlist metadata one by one until we find new videos ---
 print("Fetching metadata from Bilibili...")
-proc = subprocess.run(meta_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-if proc.stderr:
-    print("yt-dlp stderr (info/warnings):")
-    print(proc.stderr.strip()[:2000])
 
-entries = []
-for line in proc.stdout.splitlines():
-    line = line.strip()
-    if not line:
+downloaded = load_downloaded_ids()
+new_videos = []
+
+# We won't limit --playlist-end here, instead stream all videos and break early
+yt_cmd = ["yt-dlp", "-j", channel_url]
+proc = subprocess.run(yt_cmd, stdout=subprocess.PIPE, text=True, check=True)
+
+for line in proc.stdout.strip().splitlines():
+    data = json.loads(line)
+    vid_id = data.get("id")
+    title = data.get("title") or "untitled"
+    if vid_id in downloaded:
+        print(f"Skipping already-downloaded video: {vid_id} / {title}")
         continue
-    try:
-        obj = json.loads(line)
-        entries.append(obj)
-    except Exception:
-        continue
 
-if not entries:
-    print("No playlist entries found. Exiting.")
-    exit(0)
+    print(f"Found new video: {vid_id} / {title}")
+    new_videos.append(data)
 
-# Build list of videos to process (skip downloaded)
-to_process = []
-for entry in entries:
-    vid = entry.get("id") or entry.get("webpage_url") or entry.get("url")
-    if not vid:
-        print("Skipping entry without id/url")
-        continue
-    if vid in downloaded_ids:
-        print(f"Skipping already-downloaded video: {vid} / {entry.get('title')}")
-        continue
-    to_process.append((vid, entry))
+    if len(new_videos) >= max_videos:
+        break
 
-# Cap the number of new downloads per run
-to_process = to_process[:MAX_VIDEOS]
-
-if not to_process:
+if not new_videos:
     print("No new videos to download.")
     exit(0)
 
