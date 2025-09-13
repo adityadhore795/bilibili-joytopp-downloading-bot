@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Final bot.py — Bilibili -> Dropbox
+Robust Bilibili -> Dropbox bot (updated to avoid Bilibili 352 blocks).
+
+Key improvements:
+- uses yt-dlp --flat-playlist to fetch minimal metadata (avoid per-video requests)
+- retry + exponential backoff on failures
+- fallback limited per-item checks (rate-limited)
+- user-agent set to look like a browser
+- rest of the bot behavior (download, thumbnail, chunk upload, cleanup, downloaded_ids persistence) unchanged
 """
 
 import os
@@ -10,6 +17,7 @@ import dropbox
 import requests
 import re
 import time
+import random
 from pathlib import Path
 
 # ---------- Config from env ----------
@@ -25,6 +33,9 @@ REPO_PATH = Path.cwd()
 DOWNLOADED_IDS_PATH = REPO_PATH / "downloaded_ids.json"
 
 MEDIA_EXTS = (".mp4", ".mkv", ".m4a", ".webm", ".flv", ".ts", ".mov", ".avi", ".mp3", ".aac")
+
+# Use a realistic user-agent to lower chance of blocking
+USER_AGENT = os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
 
 # ---------- Utilities ----------
 def sanitize_filename_keep_unicode(s: str, max_length=120) -> str:
@@ -149,76 +160,190 @@ def chunked_upload(dbx, local_path, dropbox_path, chunk_size=50 * 1024 * 1024):
                     cursor.offset = f.tell()
     print(f"Uploaded to Dropbox: {dropbox_path}")
 
+# ---------- Playlist fetch helpers ----------
+def fetch_flat_playlist_entries(channel_url, max_retries=5, initial_delay=4):
+    """
+    Use --flat-playlist -j to get minimal JSON per entry (fast, low load).
+    Returns list of entry dicts or [] on failure.
+    """
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "-j",
+        "--no-warnings",
+        "--no-progress",
+        "--user-agent", USER_AGENT,
+        channel_url,
+    ]
+    delay = initial_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"flat-playlist attempt {attempt}...")
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=120)
+            stderr = (proc.stderr or "").strip()
+            if stderr:
+                # If rejected by server, retry; else continue
+                if "Request is rejected by server" in stderr or "352" in stderr:
+                    print(f"flat-playlist server rejected (attempt {attempt}): {stderr.splitlines()[:3]}")
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                else:
+                    print("flat-playlist stderr (info):", stderr[:400])
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            entries = []
+            for ln in lines:
+                try:
+                    obj = json.loads(ln)
+                    entries.append(obj)
+                except Exception:
+                    continue
+            if entries:
+                return entries
+            else:
+                # no entries returned — break and return empty
+                print("flat-playlist returned no entries.")
+                return []
+        except subprocess.CalledProcessError as e:
+            print(f"flat-playlist command failed (attempt {attempt}): {e}; stderr: {(e.stderr or '')[:200]}")
+            time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            print(f"flat-playlist unexpected error (attempt {attempt}): {e}")
+            time.sleep(delay)
+            delay *= 2
+    print("flat-playlist failed after retries.")
+    return []
+
+def fetch_single_item_metadata(channel_url, item_index, max_retries=3, initial_delay=3):
+    """
+    Fallback: fetch a single playlist item via --playlist-items N (heavier; rate-limit carefully).
+    Returns a dict or None.
+    """
+    cmd = [
+        "yt-dlp",
+        "-j",
+        "--no-warnings",
+        "--no-progress",
+        "--user-agent", USER_AGENT,
+        "--playlist-items", str(item_index),
+        channel_url,
+    ]
+    delay = initial_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=60)
+            stderr = (proc.stderr or "").strip()
+            if stderr and ("Request is rejected by server" in stderr or "352" in stderr):
+                print(f"single-item server rejected for index {item_index} (attempt {attempt}).")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            out = proc.stdout.strip()
+            if not out:
+                return None
+            data = json.loads(out)
+            return data
+        except subprocess.CalledProcessError as e:
+            print(f"single-item fetch failed index={item_index} attempt={attempt}: {e}; stderr: {(e.stderr or '')[:200]}")
+            time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            print(f"single-item unexpected error index={item_index} attempt={attempt}: {e}")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
 # ---------- Main ----------
 def main():
     if not (DROPBOX_APP_KEY and DROPBOX_APP_SECRET and DROPBOX_REFRESH_TOKEN):
         raise SystemExit("Please set Dropbox secrets.")
 
-    # Dropbox auth
     access_token = get_dropbox_access_token(DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN)
     dbx = dropbox.Dropbox(access_token)
 
-    # Clear remote folder
+    # Clear remote folder per your request
     print("Cleaning remote Dropbox folder:", DROPBOX_FOLDER)
     clear_dropbox_folder(dbx, DROPBOX_FOLDER)
 
-    # Load IDs
+    # Load downloaded IDs
     downloaded_ids = load_downloaded_ids(DOWNLOADED_IDS_PATH)
     print(f"Loaded {len(downloaded_ids)} previously downloaded IDs")
 
-    # --- Fetch videos one by one until new found ---
-    print("Fetching metadata from Bilibili...")
+    # 1) Try flat-playlist first (fast, light on requests)
+    print("Attempting flat-playlist fetch (low load)...")
+    entries = fetch_flat_playlist_entries(BILIBILI_CHANNEL_URL)
+
     new_videos = []
-    video_index = 1
-    while len(new_videos) < MAX_VIDEOS:
-        yt_cmd = ["yt-dlp", "-j", "--playlist-items", str(video_index), BILIBILI_CHANNEL_URL]
-        try:
-            proc = subprocess.run(yt_cmd, stdout=subprocess.PIPE, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to fetch video {video_index}, skipping. Error: {e}")
-            video_index += 1
-            continue
+    if entries:
+        for entry in entries:
+            vid = entry.get("id") or entry.get("url") or entry.get("webpage_url")
+            title = entry.get("title") or entry.get("title")  # flat entries usually have title
+            if not vid:
+                continue
+            if vid in downloaded_ids:
+                print(f"Skipping already-downloaded (flat): {vid} / {title}")
+                continue
+            # We only have id/title in flat result; we'll later download by video URL using the id
+            new_videos.append({"id": vid, "title": title, "webpage_url": f"https://www.bilibili.com/video/{vid}"})
+            if len(new_videos) >= MAX_VIDEOS:
+                break
 
-        if not proc.stdout.strip():
-            print("No more videos available in channel.")
-            break
-
-        try:
-            data = json.loads(proc.stdout.strip())
-        except json.JSONDecodeError:
-            print(f"Could not parse metadata for video {video_index}, skipping.")
-            video_index += 1
-            continue
-
-        vid_id = data.get("id")
-        title = data.get("title") or "untitled"
-
-        if vid_id in downloaded_ids:
-            print(f"Skipping already-downloaded video: {vid_id} / {title}")
-            video_index += 1
-            continue
-
-        print(f"Found new video: {vid_id} / {title}")
-        new_videos.append(data)
-        video_index += 1
+    # 2) If flat-playlist failed or returned no entries, fallback to per-item checks (rate-limited)
+    if not new_videos:
+        print("Flat-playlist returned no new items or failed, using per-item fallback (limited checks).")
+        # we will check up to max_checks items (avoid scanning whole history)
+        max_checks = int(os.getenv("BILIBILI_MAX_CHECKS", "200"))
+        idx = 1
+        while len(new_videos) < MAX_VIDEOS and idx <= max_checks:
+            data = fetch_single_item_metadata(BILIBILI_CHANNEL_URL, idx)
+            if not data:
+                idx += 1
+                continue
+            vid = data.get("id")
+            title = data.get("title") or ""
+            if not vid:
+                idx += 1
+                continue
+            if vid in downloaded_ids:
+                print(f"Skipping already-downloaded (fallback): {vid} / {title}")
+                idx += 1
+                continue
+            new_videos.append({"id": vid, "title": title, "webpage_url": data.get("webpage_url") or f"https://www.bilibili.com/video/{vid}"})
+            idx += 1
+            # small jitter to avoid being detected
+            time.sleep(random.uniform(0.8, 1.6))
 
     if not new_videos:
-        print("No new videos to download.")
+        print("No new videos found after safe checks. Exiting.")
         return
 
-    # --- Process each new video ---
-    for entry in new_videos:
-        vid = entry.get("id")
-        orig_title = entry.get("title") or ""
+    print(f"Will process {len(new_videos)} new video(s).")
+
+    # Process videos (download/upload)
+    for v in new_videos:
+        vid = v["id"]
+        orig_title = v.get("title") or ""
         translated = translate_to_english_free_or_api(orig_title)
         final_title = translated if translated else orig_title
         safe_name = sanitize_filename_keep_unicode(final_title or vid)
 
-        print(f"Downloading video {vid} as '{safe_name}'")
+        print(f"Processing {vid} — '{final_title}' -> filename '{safe_name}'")
 
-        # Download thumbnail
+        # thumbnail
         thumb_local = None
-        thumb_url = entry.get("thumbnail")
+        # We'll try to get thumbnail from the full metadata when we download (yt-dlp can write thumbnail),
+        # but keep a simple step: try to fetch thumbnail URL via yt-dlp metadata extraction (single call).
+        try:
+            meta_proc = subprocess.run(
+                ["yt-dlp", "-j", "--no-warnings", "--no-progress", "--user-agent", USER_AGENT, v["webpage_url"]],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=60
+            )
+            meta_json = json.loads(meta_proc.stdout.strip())
+            thumb_url = meta_json.get("thumbnail")
+        except Exception:
+            thumb_url = None
+
         if thumb_url:
             try:
                 r = requests.get(thumb_url, timeout=20)
@@ -229,38 +354,59 @@ def main():
                     print("Saved thumbnail as:", thumb_local)
             except Exception as e:
                 print("Thumbnail download failed:", e)
+                thumb_local = None
 
-        # Download video
+        # Download video with yt-dlp (best + merge)
         out_template = f"{safe_name}.%(ext)s"
-        dl_cmd = ["yt-dlp", "-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4", "-o", out_template, entry.get("webpage_url") or entry.get("url")]
+        dl_cmd = [
+            "yt-dlp",
+            "-f", "bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "-o", out_template,
+            "--no-warnings",
+            "--no-progress",
+            "--user-agent", USER_AGENT,
+            v["webpage_url"],
+        ]
+        print("Running yt-dlp to download video...")
         dl_proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if dl_proc.stderr:
-            print("yt-dlp stderr:", dl_proc.stderr.strip()[:1000])
+            print("yt-dlp stderr (short):", dl_proc.stderr.strip()[:800])
 
+        # find downloaded file
         downloaded_file = find_downloaded_file_by_prefix(safe_name)
         if not downloaded_file:
             time.sleep(2)
             downloaded_file = find_downloaded_file_by_prefix(safe_name)
         if not downloaded_file:
-            print(f"Could not find downloaded file for {safe_name}")
+            print(f"ERROR: downloaded file not found for {safe_name}. Skipping this video.")
             continue
 
         print("Downloaded file located:", downloaded_file)
 
-        # Upload to Dropbox
+        # upload thumbnail (fixed name)
         if thumb_local and os.path.exists(thumb_local):
             chunked_upload(dbx, thumb_local, f"{DROPBOX_FOLDER}/thumbnail.jpg")
-            os.remove(thumb_local)
+            try:
+                os.remove(thumb_local)
+            except Exception:
+                pass
+
+        # upload video (chunked)
         chunked_upload(dbx, downloaded_file, f"{DROPBOX_FOLDER}/{os.path.basename(downloaded_file)}")
 
-        # Save ID
+        # mark id and commit
         downloaded_ids.add(vid)
         save_downloaded_ids_and_commit(DOWNLOADED_IDS_PATH, downloaded_ids)
 
+        # cleanup
         try:
             os.remove(downloaded_file)
         except Exception:
             pass
+
+        # short pause between processed videos to be polite
+        time.sleep(random.uniform(1.0, 2.0))
 
     print("All done.")
 
