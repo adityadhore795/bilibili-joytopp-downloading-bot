@@ -203,7 +203,7 @@ downloaded = load_downloaded_ids(DOWNLOADED_IDS_PATH)
 new_videos = []
 
 # We won't limit --playlist-end here, instead stream all videos and break early
-yt_cmd = ["yt-dlp", "-j", channel_url]
+yt_cmd = ["yt-dlp", "-j", BILIBILI_CHANNEL_URL]
 proc = subprocess.run(yt_cmd, stdout=subprocess.PIPE, text=True, check=True)
 
 for line in proc.stdout.strip().splitlines():
