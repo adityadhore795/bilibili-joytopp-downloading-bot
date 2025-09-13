@@ -196,29 +196,52 @@ def main():
     print(f"Loaded {len(downloaded_ids)} previously downloaded IDs")
 
    # Fetch playlist metadata (JSON per entry)
-# --- Fetch playlist metadata one by one until we find new videos ---
+# --- Fetch playlist metadata safely, one by one ---
 print("Fetching metadata from Bilibili...")
 
 downloaded = load_downloaded_ids(DOWNLOADED_IDS_PATH)
 new_videos = []
 
-# We won't limit --playlist-end here, instead stream all videos and break early
-yt_cmd = ["yt-dlp", "-j", BILIBILI_CHANNEL_URL]
-proc = subprocess.run(yt_cmd, stdout=subprocess.PIPE, text=True, check=True)
+video_index = 1
+while len(new_videos) < MAX_VIDEOS:
+    yt_cmd = [
+        "yt-dlp",
+        "-j",
+        "--playlist-items", str(video_index),
+        BILIBILI_CHANNEL_URL,
+    ]
 
-for line in proc.stdout.strip().splitlines():
-    data = json.loads(line)
+    try:
+        proc = subprocess.run(
+            yt_cmd, stdout=subprocess.PIPE, text=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to fetch video {video_index}, skipping. Error: {e}")
+        video_index += 1
+        continue
+
+    if not proc.stdout.strip():
+        print("No more videos available in channel.")
+        break
+
+    try:
+        data = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError:
+        print(f"Could not parse metadata for video {video_index}, skipping.")
+        video_index += 1
+        continue
+
     vid_id = data.get("id")
     title = data.get("title") or "untitled"
+
     if vid_id in downloaded:
         print(f"Skipping already-downloaded video: {vid_id} / {title}")
+        video_index += 1
         continue
 
     print(f"Found new video: {vid_id} / {title}")
     new_videos.append(data)
-
-    if len(new_videos) >= max_videos:
-        break
+    video_index += 1
 
 if not new_videos:
     print("No new videos to download.")
