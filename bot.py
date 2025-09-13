@@ -199,7 +199,7 @@ def main():
 # --- Fetch playlist metadata one by one until we find new videos ---
 print("Fetching metadata from Bilibili...")
 
-downloaded = load_downloaded_ids()
+downloaded = load_downloaded_ids(DOWNLOADED_IDS_FILE)
 new_videos = []
 
 # We won't limit --playlist-end here, instead stream all videos and break early
