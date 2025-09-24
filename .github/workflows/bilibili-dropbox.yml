@@ -36,4 +36,5 @@ jobs:
           DROPBOX_FOLDER: "/joytopp"
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}  # <--- the cookies secret you just added
         run: python bot.py
