@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-Bilibili -> Dropbox bot with cookie support and best-video+audio merge.
-
-- Uses BILIBILI_COOKIES env secret (Netscape cookies.txt content) written to ./cookies.txt at runtime.
-- All yt-dlp calls are cookie-aware when cookies are provided.
-- Downloads best video + best audio and attempts to merge to mp4.
-- Uploads thumbnail as thumbnail.jpg and video to Dropbox (chunked for large files).
-- Keeps downloaded_ids.json to avoid duplicates and commits it back to the repo.
-- Cleans local files and removes cookies.txt after run.
+Final bot.py — cookie-aware downloader + translator + Dropbox uploader.
+If translation chain fails, uses fallback_title.txt content (repo root) as filename.
 """
 
 import os
@@ -21,24 +15,26 @@ import random
 from pathlib import Path
 import shutil
 
-# ---------- Config from env ----------
+# ---------- Config ----------
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 BILIBILI_CHANNEL_URL = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
 MAX_VIDEOS = int(os.getenv("BILIBILI_MAX_VIDEOS", "1"))
 DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/joytopp")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # optional
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")     # provided by Actions
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")     # Actions provides this
+BILIBILI_COOKIES_ENV = os.getenv("BILIBILI_COOKIES")  # cookies.txt content (secret)
+BOT_USER_AGENT = os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
+
 REPO_PATH = Path.cwd()
 DOWNLOADED_IDS_PATH = REPO_PATH / "downloaded_ids.json"
-BILIBILI_COOKIES_ENV = os.getenv("BILIBILI_COOKIES")  # the secret content with cookies.txt format
-BOT_USER_AGENT = os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
+TRANSLATIONS_PATH = REPO_PATH / "translations.json"
+FALLBACK_TITLE_PATH = REPO_PATH / "fallback_title.txt"
 
 MEDIA_EXTS = (".mp4", ".mkv", ".m4a", ".webm", ".flv", ".ts", ".mov", ".avi", ".mp3", ".aac")
 
 # ---------- Utilities ----------
-def sanitize_filename_keep_unicode(s: str, max_length=120) -> str:
+def sanitize_filename_keep_unicode(s: str, max_length=140) -> str:
     if not s:
         s = "video"
     s = s.strip()
@@ -84,7 +80,7 @@ def clear_dropbox_folder(dbx, folder_path):
         except Exception:
             pass
 
-def load_downloaded_ids(path: Path):
+def load_json_set(path: Path):
     if path.exists():
         try:
             return set(json.loads(path.read_text(encoding="utf-8")))
@@ -92,48 +88,46 @@ def load_downloaded_ids(path: Path):
             return set()
     return set()
 
+def save_json_obj(path: Path, obj):
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
 def save_downloaded_ids_and_commit(path: Path, ids_set):
-    path.write_text(json.dumps(sorted(list(ids_set)), indent=2), encoding="utf-8")
+    save_json_obj(path, sorted(list(ids_set)))
     print(f"Saved {len(ids_set)} IDs to {path}")
-
     if not GITHUB_TOKEN:
-        print("No GITHUB_TOKEN available — skipping commit of downloaded_ids.json")
+        print("No GITHUB_TOKEN — skipping commit for downloaded_ids.json")
         return
-
     try:
         subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
         subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
         subprocess.run(["git", "add", str(path)], check=True)
         subprocess.run(["git", "commit", "-m", "Update downloaded_ids.json [skip ci]"], check=False)
         repo = os.getenv("GITHUB_REPOSITORY")
-        ref = os.getenv("GITHUB_REF", "refs/heads/main")
-        branch = ref.split("/")[-1]
+        branch = os.getenv("GITHUB_REF", "refs/heads/main").split("/")[-1]
         remote = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{repo}.git"
         subprocess.run(["git", "push", remote, f"HEAD:{branch}"], check=False)
         print("Pushed downloaded_ids.json to repo")
     except Exception as e:
         print("Failed to commit/push downloaded_ids.json:", e)
 
-def translate_to_english_free_or_api(text: str) -> str:
-    if not text:
-        return text
-    if GOOGLE_API_KEY:
-        try:
-            url = "https://translation.googleapis.com/language/translate/v2"
-            resp = requests.post(url, data={"q": text, "target": "en", "format": "text", "key": GOOGLE_API_KEY}, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data["data"]["translations"][0]["translatedText"]
-        except Exception as e:
-            print("Official translate failed:", e)
+def save_translations_and_commit(path: Path, translations: dict):
     try:
-        from googletrans import Translator
-        translator = Translator()
-        result = translator.translate(text, dest="en")
-        return result.text
+        save_json_obj(path, translations)
+        print(f"Saved translations to {path}")
     except Exception as e:
-        print("Free googletrans translate failed or not available:", e)
-    return text
+        print("Failed to save translations:", e)
+    if not GITHUB_TOKEN:
+        return
+    try:
+        subprocess.run(["git", "add", str(path)], check=True)
+        subprocess.run(["git", "commit", "-m", "Update translations.json [skip ci]"], check=False)
+        repo = os.getenv("GITHUB_REPOSITORY")
+        branch = os.getenv("GITHUB_REF", "refs/heads/main").split("/")[-1]
+        remote = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{repo}.git"
+        subprocess.run(["git", "push", remote, f"HEAD:{branch}"], check=False)
+        print("Pushed translations.json to repo")
+    except Exception as e:
+        print("Failed to commit/push translations.json:", e)
 
 def find_downloaded_file_by_prefix(prefix: str):
     files = sorted(os.listdir("."), key=lambda x: os.path.getmtime(x), reverse=True)
@@ -160,8 +154,98 @@ def chunked_upload(dbx, local_path, dropbox_path, chunk_size=50 * 1024 * 1024):
                     cursor.offset = f.tell()
     print(f"Uploaded to Dropbox: {dropbox_path}")
 
-# ---------- Playlist fetch helpers (cookie-aware) ----------
-def fetch_flat_playlist_entries(channel_url, cookies_path=None, max_retries=5, initial_delay=4):
+# ---------- Translators ----------
+def load_translations(path: Path):
+    if path.exists():
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return {}
+
+def try_googletrans(text: str):
+    try:
+        from googletrans import Translator
+        translator = Translator()
+        res = translator.translate(text, dest="en")
+        return res.text
+    except Exception:
+        return None
+
+def try_deep_google(text: str):
+    try:
+        from deep_translator import GoogleTranslator
+        return GoogleTranslator(source='auto', target='en').translate(text)
+    except Exception:
+        return None
+
+def try_deep_libre(text: str):
+    try:
+        from deep_translator import LibreTranslator
+        return LibreTranslator(source='auto', target='en').translate(text)
+    except Exception:
+        return None
+
+def try_mymemory(text: str):
+    try:
+        from deep_translator import MyMemoryTranslator
+        return MyMemoryTranslator(source='auto', target='en').translate(text)
+    except Exception:
+        return None
+
+def try_unidecode(text: str):
+    try:
+        from unidecode import unidecode
+        return unidecode(text)
+    except Exception:
+        return None
+
+def translate_title_for_vid(vid: str, original_title: str, translations_cache: dict):
+    if not original_title:
+        return original_title or vid
+    if vid in translations_cache and translations_cache[vid]:
+        return translations_cache[vid]
+    attempts = [
+        ("googletrans", try_googletrans),
+        ("deep_google", try_deep_google),
+        ("libre", try_deep_libre),
+        ("mymemory", try_mymemory),
+        ("unidecode", try_unidecode),
+    ]
+    last_success = None
+    for name, fn in attempts:
+        try:
+            translated = fn(original_title)
+            if translated and translated.strip():
+                last_success = translated.strip()
+                print(f"Translated using {name}: {last_success}")
+                break
+        except Exception as e:
+            print(f"Translator {name} error (ignored): {e}")
+        time.sleep(random.uniform(0.4, 0.9))
+    if last_success:
+        translations_cache[vid] = last_success
+        return last_success
+    # all translators failed -> use fallback file content (if exists)
+    fallback = None
+    try:
+        if FALLBACK_TITLE_PATH.exists():
+            fallback = FALLBACK_TITLE_PATH.read_text(encoding="utf-8").strip()
+            if fallback:
+                translations_cache[vid] = fallback
+                print("Using fallback title from file for vid", vid)
+                return fallback
+    except Exception:
+        pass
+    # final fallback: use original title or vid
+    final = original_title or vid
+    translations_cache[vid] = final
+    return final
+
+# ---------- Playlist helpers (cookie-aware) ----------
+def fetch_flat_playlist_entries(channel_url, cookies_path=None, max_retries=4, initial_delay=4):
     cmd_base = [
         "yt-dlp",
         "--flat-playlist",
@@ -170,25 +254,18 @@ def fetch_flat_playlist_entries(channel_url, cookies_path=None, max_retries=5, i
         "--no-progress",
         "--user-agent", BOT_USER_AGENT,
     ]
-    if cookies_path:
-        cmd = cmd_base + ["--cookies", str(cookies_path), channel_url]
-    else:
-        cmd = cmd_base + [channel_url]
-
+    cmd = cmd_base + (["--cookies", str(cookies_path)] if cookies_path else []) + [channel_url]
     delay = initial_delay
     for attempt in range(1, max_retries + 1):
         try:
-            print(f"flat-playlist attempt {attempt}...")
+            print(f"flat-playlist attempt {attempt} ...")
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=120)
             stderr = (proc.stderr or "").strip()
-            if stderr:
-                if "Request is rejected by server" in stderr or "Request is blocked" in stderr or "352" in stderr or "412" in stderr:
-                    print(f"flat-playlist server rejected (attempt {attempt}): {stderr.splitlines()[:3]}")
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                else:
-                    print("flat-playlist stderr (info):", stderr[:400])
+            if stderr and ("Request is rejected by server" in stderr or "Request is blocked" in stderr or "352" in stderr or "412" in stderr):
+                print(f"flat-playlist blocked (attempt {attempt}): {stderr.splitlines()[:2]}")
+                time.sleep(delay)
+                delay *= 2
+                continue
             lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
             entries = []
             for ln in lines:
@@ -197,20 +274,15 @@ def fetch_flat_playlist_entries(channel_url, cookies_path=None, max_retries=5, i
                     entries.append(obj)
                 except Exception:
                     continue
-            if entries:
-                return entries
-            else:
-                print("flat-playlist returned no entries.")
-                return []
+            return entries
         except subprocess.CalledProcessError as e:
-            print(f"flat-playlist command failed (attempt {attempt}): {e}; stderr: {(e.stderr or '')[:200]}")
+            print(f"flat-playlist failed (attempt {attempt}): {e}; stderr: {(e.stderr or '')[:200]}")
             time.sleep(delay)
             delay *= 2
         except Exception as e:
-            print(f"flat-playlist unexpected error (attempt {attempt}): {e}")
+            print(f"flat-playlist unexpected error: {e}")
             time.sleep(delay)
             delay *= 2
-    print("flat-playlist failed after retries.")
     return []
 
 def fetch_single_item_metadata(channel_url, item_index, cookies_path=None, max_retries=3, initial_delay=3):
@@ -223,14 +295,13 @@ def fetch_single_item_metadata(channel_url, item_index, cookies_path=None, max_r
         "--playlist-items", str(item_index),
     ]
     cmd = cmd_base + (["--cookies", str(cookies_path)] if cookies_path else []) + [channel_url]
-
     delay = initial_delay
     for attempt in range(1, max_retries + 1):
         try:
             proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=60)
             stderr = (proc.stderr or "").strip()
             if stderr and ("Request is rejected by server" in stderr or "Request is blocked" in stderr or "352" in stderr or "412" in stderr):
-                print(f"single-item server rejected for index {item_index} (attempt {attempt}).")
+                print(f"single-item blocked index={item_index} (attempt {attempt}).")
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -240,28 +311,27 @@ def fetch_single_item_metadata(channel_url, item_index, cookies_path=None, max_r
             data = json.loads(out)
             return data
         except subprocess.CalledProcessError as e:
-            print(f"single-item fetch failed index={item_index} attempt={attempt}: {e}; stderr: {(e.stderr or '')[:200]}")
+            print(f"single-item failed index={item_index} attempt={attempt}: {e}; stderr: {(e.stderr or '')[:200]}")
             time.sleep(delay)
             delay *= 2
         except Exception as e:
-            print(f"single-item unexpected error index={item_index} attempt={attempt}: {e}")
+            print(f"single-item unexpected error index={item_index}: {e}")
             time.sleep(delay)
             delay *= 2
     return None
 
 # ---------- Main ----------
 def main():
-    # Write cookies file if secret present
     cookies_path = None
     if BILIBILI_COOKIES_ENV:
         cookies_path = REPO_PATH / "cookies.txt"
         cookies_path.write_text(BILIBILI_COOKIES_ENV, encoding="utf-8")
         print("Wrote cookies to", cookies_path)
 
-    # Check ffmpeg presence (for merging)
+    # check ffmpeg
     has_ffmpeg = shutil.which("ffmpeg") is not None
     if not has_ffmpeg:
-        print("Warning: ffmpeg not found in PATH. yt-dlp may not merge video+audio automatically.")
+        print("Warning: ffmpeg not found. Merging may fail or produce audio-only files.")
 
     try:
         if not (DROPBOX_APP_KEY and DROPBOX_APP_SECRET and DROPBOX_REFRESH_TOKEN):
@@ -270,15 +340,13 @@ def main():
         access_token = get_dropbox_access_token(DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN)
         dbx = dropbox.Dropbox(access_token)
 
-        # Clear folder
         print("Cleaning remote Dropbox folder:", DROPBOX_FOLDER)
         clear_dropbox_folder(dbx, DROPBOX_FOLDER)
 
-        # Load downloaded IDs
-        downloaded_ids = load_downloaded_ids(DOWNLOADED_IDS_PATH)
-        print(f"Loaded {len(downloaded_ids)} previously downloaded IDs")
+        downloaded_ids = load_json_set(DOWNLOADED_IDS_PATH)
+        translations_cache = load_translations(TRANSLATIONS_PATH)
+        print(f"Loaded {len(downloaded_ids)} downloaded IDs and {len(translations_cache)} translations")
 
-        # 1) Try flat-playlist first (fast, light on requests)
         print("Attempting flat-playlist fetch (low load)...")
         entries = fetch_flat_playlist_entries(BILIBILI_CHANNEL_URL, cookies_path=cookies_path)
 
@@ -286,19 +354,17 @@ def main():
         if entries:
             for entry in entries:
                 vid = entry.get("id") or entry.get("url") or entry.get("webpage_url")
-                title = entry.get("title") or ""
                 if not vid:
                     continue
                 if vid in downloaded_ids:
-                    print(f"Skipping already-downloaded (flat): {vid} / {title}")
+                    print(f"Skipping already-downloaded (flat): {vid}")
                     continue
-                new_videos.append({"id": vid, "title": title, "webpage_url": f"https://www.bilibili.com/video/{vid}"})
+                new_videos.append({"id": vid, "webpage_url": f"https://www.bilibili.com/video/{vid}"})
                 if len(new_videos) >= MAX_VIDEOS:
                     break
 
-        # 2) fallback per-item checks (rate-limited), if needed
         if not new_videos:
-            print("Flat-playlist gave nothing or was blocked; using per-item fallback (limited checks).")
+            print("Flat-playlist gave nothing; using per-item fallback (limited checks).")
             max_checks = int(os.getenv("BILIBILI_MAX_CHECKS", "200"))
             idx = 1
             while len(new_videos) < MAX_VIDEOS and idx <= max_checks:
@@ -308,48 +374,51 @@ def main():
                     time.sleep(random.uniform(0.6, 1.2))
                     continue
                 vid = data.get("id")
-                title = data.get("title") or ""
-                if not vid:
+                if not vid or vid in downloaded_ids:
                     idx += 1
                     continue
-                if vid in downloaded_ids:
-                    print(f"Skipping already-downloaded (fallback): {vid} / {title}")
-                    idx += 1
-                    continue
-                new_videos.append({"id": vid, "title": title, "webpage_url": data.get("webpage_url") or f"https://www.bilibili.com/video/{vid}"})
+                new_videos.append({"id": vid, "webpage_url": data.get("webpage_url") or f"https://www.bilibili.com/video/{vid}"})
                 idx += 1
                 time.sleep(random.uniform(0.8, 1.6))
 
         if not new_videos:
-            print("No new videos found after safe checks. Exiting.")
+            print("No new videos found. Exiting.")
             return
 
         print(f"Will process {len(new_videos)} new video(s).")
 
-        # Process videos
         for v in new_videos:
             vid = v["id"]
-            orig_title = v.get("title") or ""
-            translated = translate_to_english_free_or_api(orig_title)
-            final_title = translated if translated else orig_title
-            safe_name = sanitize_filename_keep_unicode(final_title or vid)
+            webpage = v["webpage_url"]
+            print("Processing", vid, webpage)
 
-            print(f"Processing {vid} — '{final_title}' -> filename '{safe_name}'")
-
-            # try to fetch full metadata (to get thumbnail), cookie-aware
-            thumb_local = None
-            thumb_url = None
+            meta_json = None
             try:
                 meta_cmd = ["yt-dlp", "-j", "--no-warnings", "--no-progress", "--user-agent", BOT_USER_AGENT]
                 if cookies_path:
                     meta_cmd += ["--cookies", str(cookies_path)]
-                meta_cmd += [v["webpage_url"]]
+                meta_cmd += [webpage]
                 meta_proc = subprocess.run(meta_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=60)
                 meta_json = json.loads(meta_proc.stdout.strip())
-                thumb_url = meta_json.get("thumbnail")
-            except Exception:
-                thumb_url = None
+            except Exception as e:
+                print("Failed to fetch full metadata for", vid, ":", e)
 
+            orig_title = ""
+            if meta_json:
+                orig_title = meta_json.get("title") or ""
+            if not orig_title:
+                orig_title = v.get("title") or ""
+
+            final_title = translate_title_for_vid(vid, orig_title, translations_cache)
+            save_translations_and_commit(TRANSLATIONS_PATH, translations_cache)
+
+            safe_name = sanitize_filename_keep_unicode(final_title or vid)
+            print(f"Title -> '{orig_title}' -> Translated -> '{final_title}' -> Filename -> '{safe_name}'")
+
+            thumb_local = None
+            thumb_url = None
+            if meta_json:
+                thumb_url = meta_json.get("thumbnail")
             if thumb_url:
                 try:
                     r = requests.get(thumb_url, timeout=20)
@@ -362,7 +431,6 @@ def main():
                     print("Thumbnail download failed:", e)
                     thumb_local = None
 
-            # Download video (cookie-aware) — FORCE best video + best audio, fallback best
             out_template = f"{safe_name}.%(ext)s"
             dl_cmd = [
                 "yt-dlp",
@@ -375,25 +443,23 @@ def main():
             ]
             if cookies_path:
                 dl_cmd += ["--cookies", str(cookies_path)]
-            dl_cmd += [v["webpage_url"]]
+            dl_cmd += [webpage]
 
             print("Running yt-dlp to download (best video + audio, merging to mp4)...")
             dl_proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if dl_proc.stderr:
                 print("yt-dlp stderr (short):", dl_proc.stderr.strip()[:1000])
 
-            # find downloaded file
             downloaded_file = find_downloaded_file_by_prefix(safe_name)
             if not downloaded_file:
                 time.sleep(2)
                 downloaded_file = find_downloaded_file_by_prefix(safe_name)
             if not downloaded_file:
-                print(f"ERROR: downloaded file not found for {safe_name}. Skipping.")
+                print(f"ERROR: downloaded file not found for {safe_name}; skipping this video.")
                 continue
 
             print("Downloaded file located:", downloaded_file)
 
-            # upload thumbnail
             if thumb_local and os.path.exists(thumb_local):
                 chunked_upload(dbx, thumb_local, f"{DROPBOX_FOLDER}/thumbnail.jpg")
                 try:
@@ -401,26 +467,22 @@ def main():
                 except Exception:
                     pass
 
-            # upload video
             chunked_upload(dbx, downloaded_file, f"{DROPBOX_FOLDER}/{os.path.basename(downloaded_file)}")
 
-            # record ID and commit
             downloaded_ids.add(vid)
             save_downloaded_ids_and_commit(DOWNLOADED_IDS_PATH, downloaded_ids)
+            save_translations_and_commit(TRANSLATIONS_PATH, translations_cache)
 
-            # cleanup local file
             try:
                 os.remove(downloaded_file)
             except Exception:
                 pass
 
-            # be polite between videos
             time.sleep(random.uniform(1.0, 2.0))
 
         print("All done.")
 
     finally:
-        # Remove cookies file if we created it (security)
         try:
             if BILIBILI_COOKIES_ENV:
                 p = REPO_PATH / "cookies.txt"
