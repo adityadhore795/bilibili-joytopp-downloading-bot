@@ -23,7 +23,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ffmpeg git
           python -m pip install --upgrade pip
-          pip install yt-dlp dropbox requests googletrans==4.0.0-rc1
+          pip install yt-dlp dropbox requests googletrans==4.0.0-rc1 deep-translator Unidecode
 
 
       - name: Run bot
