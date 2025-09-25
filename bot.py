@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Final bot.py — cookie-aware downloader + translator + Dropbox uploader.
-If translation chain fails, uses fallback_title.txt content (repo root) as filename.
+Bilibili -> Dropbox bot (cookie-aware) with robust retry policy.
+
+Rules implemented:
+- Try to download each video in best quality (bv*+ba/b) and merge to mp4.
+- If a download fails, retry the same video up to DOWNLOAD_RETRIES times.
+- If still failing, do NOT save that video's ID; increment SKIP counter and move to the next video.
+- If SKIP counter reaches SKIP_LIMIT in a single run, stop processing further videos.
+- Continue until MAX_VIDEOS successful downloads or stop due to SKIP_LIMIT or no more entries.
+- All other features retained: cookies support, thumbnail as thumbnail.jpg, translation chain + caching,
+  chunked Dropbox uploads, downloaded_ids.json & translations.json persistence and commit, cleanup.
 """
 
 import os
@@ -14,6 +22,7 @@ import time
 import random
 from pathlib import Path
 import shutil
+import sys
 
 # ---------- Config ----------
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
@@ -22,9 +31,13 @@ DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 BILIBILI_CHANNEL_URL = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
 MAX_VIDEOS = int(os.getenv("BILIBILI_MAX_VIDEOS", "1"))
 DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/joytopp")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")     # Actions provides this
-BILIBILI_COOKIES_ENV = os.getenv("BILIBILI_COOKIES")  # cookies.txt content (secret)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+BILIBILI_COOKIES_ENV = os.getenv("BILIBILI_COOKIES")  # cookies.txt content
 BOT_USER_AGENT = os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
+
+# Retry & skip policy (can be overridden via env)
+DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))  # total attempts per video
+SKIP_LIMIT = int(os.getenv("SKIP_LIMIT", "5"))            # how many skipped videos allowed before stopping this run
 
 REPO_PATH = Path.cwd()
 DOWNLOADED_IDS_PATH = REPO_PATH / "downloaded_ids.json"
@@ -136,6 +149,17 @@ def find_downloaded_file_by_prefix(prefix: str):
             return os.path.abspath(fname)
     return None
 
+def remove_partial_files(prefix: str):
+    # remove files that start with prefix and are media ext or temp
+    for f in os.listdir("."):
+        if f.startswith(prefix):
+            try:
+                if any(f.lower().endswith(ext) for ext in MEDIA_EXTS) or f.endswith(".part") or f.endswith(".tmp"):
+                    os.remove(f)
+                    print("Removed partial file:", f)
+            except Exception:
+                pass
+
 def chunked_upload(dbx, local_path, dropbox_path, chunk_size=50 * 1024 * 1024):
     file_size = os.path.getsize(local_path)
     with open(local_path, "rb") as f:
@@ -154,7 +178,7 @@ def chunked_upload(dbx, local_path, dropbox_path, chunk_size=50 * 1024 * 1024):
                     cursor.offset = f.tell()
     print(f"Uploaded to Dropbox: {dropbox_path}")
 
-# ---------- Translators ----------
+# ---------- Translators (unchanged chain) ----------
 def load_translations(path: Path):
     if path.exists():
         try:
@@ -228,8 +252,7 @@ def translate_title_for_vid(vid: str, original_title: str, translations_cache: d
     if last_success:
         translations_cache[vid] = last_success
         return last_success
-    # all translators failed -> use fallback file content (if exists)
-    fallback = None
+    # fallback to file if present
     try:
         if FALLBACK_TITLE_PATH.exists():
             fallback = FALLBACK_TITLE_PATH.read_text(encoding="utf-8").strip()
@@ -239,7 +262,6 @@ def translate_title_for_vid(vid: str, original_title: str, translations_cache: d
                 return fallback
     except Exception:
         pass
-    # final fallback: use original title or vid
     final = original_title or vid
     translations_cache[vid] = final
     return final
@@ -328,7 +350,15 @@ def main():
         cookies_path.write_text(BILIBILI_COOKIES_ENV, encoding="utf-8")
         print("Wrote cookies to", cookies_path)
 
-    # check ffmpeg
+    # ensure git identity early so commits don't error
+    if GITHUB_TOKEN:
+        try:
+            subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+            subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+        except Exception:
+            pass
+
+    # detect ffmpeg
     has_ffmpeg = shutil.which("ffmpeg") is not None
     if not has_ffmpeg:
         print("Warning: ffmpeg not found. Merging may fail or produce audio-only files.")
@@ -348,50 +378,56 @@ def main():
         print(f"Loaded {len(downloaded_ids)} downloaded IDs and {len(translations_cache)} translations")
 
         print("Attempting flat-playlist fetch (low load)...")
-        entries = fetch_flat_playlist_entries(BILIBILI_CHANNEL_URL, cookies_path=cookies_path)
+        entries = fetch_flat_playlist_entries(BILIBILI_CHANNEL_URL, cookies_path=cookies_path) or []
 
-        new_videos = []
-        if entries:
-            for entry in entries:
-                vid = entry.get("id") or entry.get("url") or entry.get("webpage_url")
-                if not vid:
-                    continue
-                if vid in downloaded_ids:
-                    print(f"Skipping already-downloaded (flat): {vid}")
-                    continue
-                new_videos.append({"id": vid, "webpage_url": f"https://www.bilibili.com/video/{vid}"})
-                if len(new_videos) >= MAX_VIDEOS:
-                    break
+        # Build a list of entries (if flat-playlist returns minimal info, we will fetch metadata later)
+        candidates = []
+        for entry in entries:
+            vid = entry.get("id") or entry.get("url") or entry.get("webpage_url")
+            if not vid:
+                continue
+            if vid in downloaded_ids:
+                print(f"Skipping already-downloaded (flat): {vid}")
+                continue
+            candidates.append({"id": vid, "webpage_url": f"https://www.bilibili.com/video/{vid}"})
+            # we intentionally do not stop at MAX_VIDEOS here; we'll process sequentially and count successes
 
-        if not new_videos:
-            print("Flat-playlist gave nothing; using per-item fallback (limited checks).")
+        # fallback per-item if flat returned nothing
+        if not candidates:
+            print("Flat-playlist returned nothing; using per-item fallback (limited checks).")
             max_checks = int(os.getenv("BILIBILI_MAX_CHECKS", "200"))
             idx = 1
-            while len(new_videos) < MAX_VIDEOS and idx <= max_checks:
+            while len(candidates) < max_checks:
                 data = fetch_single_item_metadata(BILIBILI_CHANNEL_URL, idx, cookies_path=cookies_path)
+                idx += 1
                 if not data:
-                    idx += 1
-                    time.sleep(random.uniform(0.6, 1.2))
+                    if idx > max_checks:
+                        break
                     continue
                 vid = data.get("id")
                 if not vid or vid in downloaded_ids:
-                    idx += 1
                     continue
-                new_videos.append({"id": vid, "webpage_url": data.get("webpage_url") or f"https://www.bilibili.com/video/{vid}"})
-                idx += 1
-                time.sleep(random.uniform(0.8, 1.6))
+                candidates.append({"id": vid, "webpage_url": data.get("webpage_url") or f"https://www.bilibili.com/video/{vid}"})
+                if len(candidates) >= max_checks:
+                    break
 
-        if not new_videos:
-            print("No new videos found. Exiting.")
+        if not candidates:
+            print("No candidate videos found. Exiting.")
             return
 
-        print(f"Will process {len(new_videos)} new video(s).")
+        print(f"Found {len(candidates)} candidate videos. Will attempt downloads until {MAX_VIDEOS} successes or {SKIP_LIMIT} skips.")
 
-        for v in new_videos:
-            vid = v["id"]
-            webpage = v["webpage_url"]
-            print("Processing", vid, webpage)
+        successes = 0
+        skips = 0
+        idx = 0
+        while successes < MAX_VIDEOS and idx < len(candidates) and skips < SKIP_LIMIT:
+            cand = candidates[idx]
+            idx += 1
+            vid = cand["id"]
+            webpage = cand["webpage_url"]
+            print(f"Processing candidate {vid} ({idx}/{len(candidates)})")
 
+            # Fetch full metadata for title & thumbnail
             meta_json = None
             try:
                 meta_cmd = ["yt-dlp", "-j", "--no-warnings", "--no-progress", "--user-agent", BOT_USER_AGENT]
@@ -401,24 +437,19 @@ def main():
                 meta_proc = subprocess.run(meta_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True, timeout=60)
                 meta_json = json.loads(meta_proc.stdout.strip())
             except Exception as e:
-                print("Failed to fetch full metadata for", vid, ":", e)
+                print("Failed to fetch metadata for", vid, ":", e)
 
-            orig_title = ""
-            if meta_json:
-                orig_title = meta_json.get("title") or ""
-            if not orig_title:
-                orig_title = v.get("title") or ""
-
+            orig_title = (meta_json.get("title") if meta_json else "") or ""
             final_title = translate_title_for_vid(vid, orig_title, translations_cache)
+            # Persist translations early
             save_translations_and_commit(TRANSLATIONS_PATH, translations_cache)
 
             safe_name = sanitize_filename_keep_unicode(final_title or vid)
             print(f"Title -> '{orig_title}' -> Translated -> '{final_title}' -> Filename -> '{safe_name}'")
 
+            # Prepare thumbnail
             thumb_local = None
-            thumb_url = None
-            if meta_json:
-                thumb_url = meta_json.get("thumbnail")
+            thumb_url = meta_json.get("thumbnail") if meta_json else None
             if thumb_url:
                 try:
                     r = requests.get(thumb_url, timeout=20)
@@ -431,56 +462,106 @@ def main():
                     print("Thumbnail download failed:", e)
                     thumb_local = None
 
-            out_template = f"{safe_name}.%(ext)s"
-            dl_cmd = [
-                "yt-dlp",
-                "-f", "bv*+ba/b",
-                "--merge-output-format", "mp4",
-                "-o", out_template,
-                "--no-warnings",
-                "--no-progress",
-                "--user-agent", BOT_USER_AGENT,
-            ]
-            if cookies_path:
-                dl_cmd += ["--cookies", str(cookies_path)]
-            dl_cmd += [webpage]
+            # Download with retries
+            download_ok = False
+            attempt = 0
+            while attempt < DOWNLOAD_RETRIES and not download_ok:
+                attempt += 1
+                print(f"Download attempt {attempt}/{DOWNLOAD_RETRIES} for {vid}")
+                out_template = f"{safe_name}.%(ext)s"
+                dl_cmd = [
+                    "yt-dlp",
+                    "-f", "bv*+ba/b",
+                    "--merge-output-format", "mp4",
+                    "-o", out_template,
+                    "--no-warnings",
+                    "--no-progress",
+                    "--user-agent", BOT_USER_AGENT,
+                ]
+                if cookies_path:
+                    dl_cmd += ["--cookies", str(cookies_path)]
+                dl_cmd += [webpage]
 
-            print("Running yt-dlp to download (best video + audio, merging to mp4)...")
-            dl_proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if dl_proc.stderr:
-                print("yt-dlp stderr (short):", dl_proc.stderr.strip()[:1000])
+                dl_proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stderr_snip = (dl_proc.stderr or "").strip()[:1000]
+                if stderr_snip:
+                    print("yt-dlp stderr (short):", stderr_snip)
 
-            downloaded_file = find_downloaded_file_by_prefix(safe_name)
-            if not downloaded_file:
-                time.sleep(2)
                 downloaded_file = find_downloaded_file_by_prefix(safe_name)
-            if not downloaded_file:
-                print(f"ERROR: downloaded file not found for {safe_name}; skipping this video.")
+                if downloaded_file and os.path.getsize(downloaded_file) > 100:  # >100 bytes sanity
+                    print("Downloaded file located:", downloaded_file)
+                    download_ok = True
+                    break
+                else:
+                    # cleanup partials if any
+                    remove_partial_files(safe_name)
+                    if attempt < DOWNLOAD_RETRIES:
+                        sleep_for = random.uniform(5.0, 12.0)
+                        print(f"Download failed for {vid} on attempt {attempt}. Waiting {sleep_for:.1f}s before retry.")
+                        time.sleep(sleep_for)
+                    else:
+                        print(f"Download failed for {vid} after {DOWNLOAD_RETRIES} attempts; will skip this video.")
+
+            if not download_ok:
+                skips += 1
+                print(f"Skipping video {vid}. Skips so far this run: {skips}/{SKIP_LIMIT}")
+                # remove thumbnail local if created
+                try:
+                    if thumb_local and os.path.exists(thumb_local):
+                        os.remove(thumb_local)
+                except Exception:
+                    pass
+                # do NOT add vid to downloaded_ids
+                # continue to next candidate
                 continue
 
-            print("Downloaded file located:", downloaded_file)
-
+            # Upload thumbnail
             if thumb_local and os.path.exists(thumb_local):
-                chunked_upload(dbx, thumb_local, f"{DROPBOX_FOLDER}/thumbnail.jpg")
+                try:
+                    chunked_upload(dbx, thumb_local, f"{DROPBOX_FOLDER}/thumbnail.jpg")
+                except Exception as e:
+                    print("Thumbnail upload failed:", e)
                 try:
                     os.remove(thumb_local)
                 except Exception:
                     pass
 
-            chunked_upload(dbx, downloaded_file, f"{DROPBOX_FOLDER}/{os.path.basename(downloaded_file)}")
+            # Upload video
+            try:
+                chunked_upload(dbx, downloaded_file, f"{DROPBOX_FOLDER}/{os.path.basename(downloaded_file)}")
+            except Exception as e:
+                print("Video upload failed:", e)
+                # do not mark as downloaded if upload failed; cleanup and skip
+                try:
+                    os.remove(downloaded_file)
+                except Exception:
+                    pass
+                skips += 1
+                print(f"Skipping video {vid} due to upload failure. Skips so far: {skips}/{SKIP_LIMIT}")
+                if skips >= SKIP_LIMIT:
+                    print("Reached skip limit after upload failure; stopping further processing.")
+                    break
+                continue
 
+            # Success: record and commit
             downloaded_ids.add(vid)
             save_downloaded_ids_and_commit(DOWNLOADED_IDS_PATH, downloaded_ids)
+            # translations already saved earlier, but ensure persisted
             save_translations_and_commit(TRANSLATIONS_PATH, translations_cache)
 
+            # cleanup local file
             try:
                 os.remove(downloaded_file)
             except Exception:
                 pass
 
+            successes += 1
+            print(f"Successfully processed {vid}. Total successes this run: {successes}/{MAX_VIDEOS}")
+
+            # polite pause between successful videos
             time.sleep(random.uniform(1.0, 2.0))
 
-        print("All done.")
+        print(f"Run finished: {successes} successful downloads, {skips} skipped videos.")
 
     finally:
         try:
