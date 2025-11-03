@@ -1,4 +1,4 @@
-name: Bilibili → Dropbox
+name: Bilibili → YouTube
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # required so the Action can push downloaded_ids.json back to repo
+  contents: write   # required so the Action can push downloaded_ids.json & token updates
 
 jobs:
   run:
@@ -23,8 +23,8 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ffmpeg git
           python -m pip install --upgrade pip
-          pip install yt-dlp dropbox requests googletrans==4.0.0-rc1 deep-translator Unidecode
-
+          pip install yt-dlp dropbox requests googletrans==4.0.0-rc1 deep-translator Unidecode \
+                      google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
 
       - name: Run bot
         env:
@@ -36,5 +36,5 @@ jobs:
           DROPBOX_FOLDER: "/joytopp"
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}  # <--- the cookies secret you just added
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
         run: python bot.py
