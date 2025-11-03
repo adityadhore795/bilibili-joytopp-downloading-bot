@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Bilibili -> Dropbox bot (cookie-aware) with robust retry policy.
+Bilibili -> YouTube uploader (cookie-aware) with robust retry & translation.
 
-Rules implemented:
-- Try to download each video in best quality (bv*+ba/b) and merge to mp4.
-- If a download fails, retry the same video up to DOWNLOAD_RETRIES times.
-- If still failing, do NOT save that video's ID; increment SKIP counter and move to the next video.
-- If SKIP counter reaches SKIP_LIMIT in a single run, stop processing further videos.
-- Continue until MAX_VIDEOS successful downloads or stop due to SKIP_LIMIT or no more entries.
-- All other features retained: cookies support, thumbnail as thumbnail.jpg, translation chain + caching,
-  chunked Dropbox uploads, downloaded_ids.json & translations.json persistence and commit, cleanup.
+Changes vs previous Dropbox version:
+- Removes Dropbox upload step and uploads directly to YouTube via YouTube Data API v3.
+- Keeps retry logic, translation chain, thumbnail saved as thumbnail.jpg.
+- If token.json not present in repo root, reads env var YOUTUBE_TOKEN_JSON (full token.json content) and writes token.json.
+- Uses resumable uploads for large files.
+- Tries to download best available quality (bestvideo+bestaudio/best) and merges to mp4.
+- If download fails after retries, does NOT mark ID as downloaded.
+- Honors SKIP_LIMIT and MAX_VIDEOS.
 """
 
 import os
 import subprocess
 import json
-import dropbox
 import requests
 import re
 import time
@@ -24,16 +23,26 @@ from pathlib import Path
 import shutil
 import sys
 
+# Google API imports (installed in workflow)
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload, ResumableMedia, MediaIoBaseUpload
+
 # ---------- Config ----------
-DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 BILIBILI_CHANNEL_URL = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
 MAX_VIDEOS = int(os.getenv("BILIBILI_MAX_VIDEOS", "1"))
-DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER", "/joytopp")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-BILIBILI_COOKIES_ENV = os.getenv("BILIBILI_COOKIES")  # cookies.txt content
+BILIBILI_COOKIES_ENV = os.getenv("BILIBILI_COOKIES")  # cookies.txt content (secret)
 BOT_USER_AGENT = os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
+
+# YouTube settings (set via repo secrets/env)
+# If you uploaded a token.json file to repo root, script will use it.
+# Otherwise set secret YOUTUBE_TOKEN_JSON with full token.json content (string) and script will write it.
+YOUTUBE_TOKEN_ENV = os.getenv("YOUTUBE_TOKEN_JSON")  # optional: token.json content
+YOUTUBE_CLIENT_SECRETS_PATH = os.getenv("YOUTUBE_CLIENT_SECRET_PATH", "client_secret.json")  # repo root file
+YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "public")
+YOUTUBE_CATEGORY_ID = os.getenv("YOUTUBE_CATEGORY_ID", "22")
+YOUTUBE_DESCRIPTION = os.getenv("YOUTUBE_DESCRIPTION", "Uploaded automatically.")  # can be overridden in env
 
 # Retry & skip policy (can be overridden via env)
 DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))  # total attempts per video
@@ -43,8 +52,10 @@ REPO_PATH = Path.cwd()
 DOWNLOADED_IDS_PATH = REPO_PATH / "downloaded_ids.json"
 TRANSLATIONS_PATH = REPO_PATH / "translations.json"
 FALLBACK_TITLE_PATH = REPO_PATH / "fallback_title.txt"
+TOKEN_PATH = REPO_PATH / "token.json"
 
 MEDIA_EXTS = (".mp4", ".mkv", ".m4a", ".webm", ".flv", ".ts", ".mov", ".avi", ".mp3", ".aac")
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 # ---------- Utilities ----------
 def sanitize_filename_keep_unicode(s: str, max_length=140) -> str:
@@ -58,40 +69,6 @@ def sanitize_filename_keep_unicode(s: str, max_length=140) -> str:
     if not s:
         s = "video"
     return s
-
-def get_dropbox_access_token(app_key, app_secret, refresh_token):
-    resp = requests.post(
-        "https://api.dropboxapi.com/oauth2/token",
-        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-        auth=(app_key, app_secret),
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-def clear_dropbox_folder(dbx, folder_path):
-    try:
-        res = dbx.files_list_folder(folder_path)
-        for entry in res.entries:
-            try:
-                dbx.files_delete_v2(entry.path_lower)
-                print(f"Deleted {entry.name} from Dropbox")
-            except Exception as e:
-                print("Failed to delete", entry, e)
-        while res.has_more:
-            res = dbx.files_list_folder_continue(res.cursor)
-            for entry in res.entries:
-                try:
-                    dbx.files_delete_v2(entry.path_lower)
-                    print(f"Deleted {entry.name} from Dropbox")
-                except Exception as e:
-                    print("Failed to delete", entry, e)
-    except dropbox.exceptions.ApiError:
-        try:
-            dbx.files_create_folder_v2(folder_path)
-            print(f"Created Dropbox folder {folder_path}")
-        except Exception:
-            pass
 
 def load_json_set(path: Path):
     if path.exists():
@@ -150,7 +127,6 @@ def find_downloaded_file_by_prefix(prefix: str):
     return None
 
 def remove_partial_files(prefix: str):
-    # remove files that start with prefix and are media ext or temp
     for f in os.listdir("."):
         if f.startswith(prefix):
             try:
@@ -160,25 +136,7 @@ def remove_partial_files(prefix: str):
             except Exception:
                 pass
 
-def chunked_upload(dbx, local_path, dropbox_path, chunk_size=50 * 1024 * 1024):
-    file_size = os.path.getsize(local_path)
-    with open(local_path, "rb") as f:
-        if file_size <= 150 * 1024 * 1024:
-            dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
-        else:
-            print(f"Large file {local_path} -> using chunked upload ({file_size/1024/1024:.1f} MB)")
-            upload_session_start_result = dbx.files_upload_session_start(f.read(chunk_size))
-            cursor = dropbox.files.UploadSessionCursor(session_id=upload_session_start_result.session_id, offset=f.tell())
-            commit = dropbox.files.CommitInfo(path=dropbox_path, mode=dropbox.files.WriteMode.overwrite)
-            while f.tell() < file_size:
-                if (file_size - f.tell()) <= chunk_size:
-                    dbx.files_upload_session_finish(f.read(chunk_size), cursor, commit)
-                else:
-                    dbx.files_upload_session_append_v2(f.read(chunk_size), cursor)
-                    cursor.offset = f.tell()
-    print(f"Uploaded to Dropbox: {dropbox_path}")
-
-# ---------- Translators (unchanged chain) ----------
+# ---------- Translators ----------
 def load_translations(path: Path):
     if path.exists():
         try:
@@ -266,7 +224,7 @@ def translate_title_for_vid(vid: str, original_title: str, translations_cache: d
     translations_cache[vid] = final
     return final
 
-# ---------- Playlist helpers (cookie-aware) ----------
+# ---------- Playlist helpers ----------
 def fetch_flat_playlist_entries(channel_url, cookies_path=None, max_retries=4, initial_delay=4):
     cmd_base = [
         "yt-dlp",
@@ -342,6 +300,83 @@ def fetch_single_item_metadata(channel_url, item_index, cookies_path=None, max_r
             delay *= 2
     return None
 
+# ---------- YouTube helpers ----------
+def ensure_token_file():
+    # If token.json exists in repo root, use it.
+    if TOKEN_PATH.exists():
+        print("token.json found in repo root.")
+        return True
+    # Otherwise, check env YOUTUBE_TOKEN_JSON and write it
+    token_env = os.getenv("YOUTUBE_TOKEN_JSON")
+    if token_env:
+        try:
+            TOKEN_PATH.write_text(token_env, encoding="utf-8")
+            print("Wrote token.json from YOUTUBE_TOKEN_JSON env.")
+            return True
+        except Exception as e:
+            print("Failed to write token.json from env:", e)
+            return False
+    print("No token.json found and no YOUTUBE_TOKEN_JSON env present.")
+    return False
+
+def get_youtube_service():
+    if not ensure_token_file():
+        raise SystemExit("token.json missing (add token.json to repo root or set YOUTUBE_TOKEN_JSON secret).")
+    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    service = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    return service
+
+def youtube_upload_video(service, file_path, title, description, privacy="public", category_id="22"):
+    """
+    Uploads video via resumable upload. Returns the uploaded YouTube videoId.
+    """
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "categoryId": str(category_id),
+        },
+        "status": {
+            "privacyStatus": privacy,
+        }
+    }
+
+    media = MediaFileUpload(file_path, chunksize=256 * 1024, resumable=True, mimetype="video/*")
+    request = service.videos().insert(part="snippet,status", body=body, media_body=media)
+
+    response = None
+    error = None
+    retry = 0
+    MAX_RETRIES = 10
+    while response is None:
+        try:
+            print("Initiating resumable upload to YouTube...")
+            status, response = request.next_chunk()
+            if response:
+                if "id" in response:
+                    print("Upload completed, video ID:", response["id"])
+                    return response["id"]
+                else:
+                    raise Exception("Unexpected response: " + str(response))
+        except Exception as e:
+            error = e
+            retry += 1
+            if retry > MAX_RETRIES:
+                print("Exceeded max retries for YouTube upload:", e)
+                raise
+            sleep_seconds = random.uniform(2 ** retry, 2 ** retry + 2)
+            print(f"Upload error, retry {retry}/{MAX_RETRIES}, sleeping {sleep_seconds:.1f}s: {e}")
+            time.sleep(sleep_seconds)
+
+def youtube_set_thumbnail(service, video_id, thumbnail_path):
+    try:
+        media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+        request = service.thumbnails().set(videoId=video_id, media_body=media)
+        resp = request.execute()
+        print("Thumbnail set response:", resp)
+    except Exception as e:
+        print("Failed to set thumbnail:", e)
+
 # ---------- Main ----------
 def main():
     cookies_path = None
@@ -350,7 +385,7 @@ def main():
         cookies_path.write_text(BILIBILI_COOKIES_ENV, encoding="utf-8")
         print("Wrote cookies to", cookies_path)
 
-    # ensure git identity early so commits don't error
+    # ensure git identity early
     if GITHUB_TOKEN:
         try:
             subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
@@ -358,21 +393,18 @@ def main():
         except Exception:
             pass
 
-    # detect ffmpeg
     has_ffmpeg = shutil.which("ffmpeg") is not None
     if not has_ffmpeg:
         print("Warning: ffmpeg not found. Merging may fail or produce audio-only files.")
 
+    # prepare youtube service (requires token.json present or env)
     try:
-        if not (DROPBOX_APP_KEY and DROPBOX_APP_SECRET and DROPBOX_REFRESH_TOKEN):
-            raise SystemExit("Please set Dropbox secrets.")
+        yt_service = get_youtube_service()
+    except Exception as e:
+        print("YouTube service initialization failed:", e)
+        raise SystemExit("YouTube auth missing or invalid. Ensure token.json exists or YOUTUBE_TOKEN_JSON secret is set.")
 
-        access_token = get_dropbox_access_token(DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN)
-        dbx = dropbox.Dropbox(access_token)
-
-        print("Cleaning remote Dropbox folder:", DROPBOX_FOLDER)
-        clear_dropbox_folder(dbx, DROPBOX_FOLDER)
-
+    try:
         downloaded_ids = load_json_set(DOWNLOADED_IDS_PATH)
         translations_cache = load_translations(TRANSLATIONS_PATH)
         print(f"Loaded {len(downloaded_ids)} downloaded IDs and {len(translations_cache)} translations")
@@ -380,7 +412,6 @@ def main():
         print("Attempting flat-playlist fetch (low load)...")
         entries = fetch_flat_playlist_entries(BILIBILI_CHANNEL_URL, cookies_path=cookies_path) or []
 
-        # Build a list of entries (if flat-playlist returns minimal info, we will fetch metadata later)
         candidates = []
         for entry in entries:
             vid = entry.get("id") or entry.get("url") or entry.get("webpage_url")
@@ -390,9 +421,7 @@ def main():
                 print(f"Skipping already-downloaded (flat): {vid}")
                 continue
             candidates.append({"id": vid, "webpage_url": f"https://www.bilibili.com/video/{vid}"})
-            # we intentionally do not stop at MAX_VIDEOS here; we'll process sequentially and count successes
 
-        # fallback per-item if flat returned nothing
         if not candidates:
             print("Flat-playlist returned nothing; using per-item fallback (limited checks).")
             max_checks = int(os.getenv("BILIBILI_MAX_CHECKS", "200"))
@@ -441,7 +470,6 @@ def main():
 
             orig_title = (meta_json.get("title") if meta_json else "") or ""
             final_title = translate_title_for_vid(vid, orig_title, translations_cache)
-            # Persist translations early
             save_translations_and_commit(TRANSLATIONS_PATH, translations_cache)
 
             safe_name = sanitize_filename_keep_unicode(final_title or vid)
@@ -462,7 +490,7 @@ def main():
                     print("Thumbnail download failed:", e)
                     thumb_local = None
 
-            # Download with retries
+            # Download with retries (try best quality)
             download_ok = False
             attempt = 0
             while attempt < DOWNLOAD_RETRIES and not download_ok:
@@ -471,13 +499,15 @@ def main():
                 out_template = f"{safe_name}.%(ext)s"
                 dl_cmd = [
                     "yt-dlp",
-                    "-f", "bv*+ba/b",
+                    "-f", "bestvideo+bestaudio/best",
                     "--merge-output-format", "mp4",
                     "-o", out_template,
                     "--no-warnings",
                     "--no-progress",
                     "--user-agent", BOT_USER_AGENT,
                 ]
+                # give yt-dlp more aggressive extractor options to find the best
+                dl_cmd += ["--all-subs", "--no-playlist"]
                 if cookies_path:
                     dl_cmd += ["--cookies", str(cookies_path)]
                 dl_cmd += [webpage]
@@ -488,12 +518,11 @@ def main():
                     print("yt-dlp stderr (short):", stderr_snip)
 
                 downloaded_file = find_downloaded_file_by_prefix(safe_name)
-                if downloaded_file and os.path.getsize(downloaded_file) > 100:  # >100 bytes sanity
+                if downloaded_file and os.path.getsize(downloaded_file) > 100:  # sanity
                     print("Downloaded file located:", downloaded_file)
                     download_ok = True
                     break
                 else:
-                    # cleanup partials if any
                     remove_partial_files(safe_name)
                     if attempt < DOWNLOAD_RETRIES:
                         sleep_for = random.uniform(5.0, 12.0)
@@ -505,33 +534,19 @@ def main():
             if not download_ok:
                 skips += 1
                 print(f"Skipping video {vid}. Skips so far this run: {skips}/{SKIP_LIMIT}")
-                # remove thumbnail local if created
                 try:
                     if thumb_local and os.path.exists(thumb_local):
                         os.remove(thumb_local)
                 except Exception:
                     pass
-                # do NOT add vid to downloaded_ids
-                # continue to next candidate
                 continue
 
-            # Upload thumbnail
-            if thumb_local and os.path.exists(thumb_local):
-                try:
-                    chunked_upload(dbx, thumb_local, f"{DROPBOX_FOLDER}/thumbnail.jpg")
-                except Exception as e:
-                    print("Thumbnail upload failed:", e)
-                try:
-                    os.remove(thumb_local)
-                except Exception:
-                    pass
-
-            # Upload video
+            # Upload to YouTube
             try:
-                chunked_upload(dbx, downloaded_file, f"{DROPBOX_FOLDER}/{os.path.basename(downloaded_file)}")
+                description = f"{YOUTUBE_DESCRIPTION}\n\nOriginal: {webpage}"
+                video_id = youtube_upload_video(yt_service, downloaded_file, final_title, description, privacy=YOUTUBE_PRIVACY_STATUS, category_id=YOUTUBE_CATEGORY_ID)
             except Exception as e:
                 print("Video upload failed:", e)
-                # do not mark as downloaded if upload failed; cleanup and skip
                 try:
                     os.remove(downloaded_file)
                 except Exception:
@@ -543,25 +558,33 @@ def main():
                     break
                 continue
 
-            # Success: record and commit
+            # Set thumbnail if present
+            if thumb_local and os.path.exists(thumb_local):
+                try:
+                    youtube_set_thumbnail(yt_service, video_id, thumb_local)
+                except Exception as e:
+                    print("Thumbnail set failed:", e)
+                try:
+                    os.remove(thumb_local)
+                except Exception:
+                    pass
+
+            # record success (mark as downloaded)
             downloaded_ids.add(vid)
             save_downloaded_ids_and_commit(DOWNLOADED_IDS_PATH, downloaded_ids)
-            # translations already saved earlier, but ensure persisted
             save_translations_and_commit(TRANSLATIONS_PATH, translations_cache)
 
-            # cleanup local file
+            # cleanup local video
             try:
                 os.remove(downloaded_file)
             except Exception:
                 pass
 
             successes += 1
-            print(f"Successfully processed {vid}. Total successes this run: {successes}/{MAX_VIDEOS}")
-
-            # polite pause between successful videos
+            print(f"Successfully processed {vid} -> YouTube ID {video_id}. Total successes this run: {successes}/{MAX_VIDEOS}")
             time.sleep(random.uniform(1.0, 2.0))
 
-        print(f"Run finished: {successes} successful downloads, {skips} skipped videos.")
+        print(f"Run finished: {successes} successful uploads, {skips} skipped videos.")
 
     finally:
         try:
