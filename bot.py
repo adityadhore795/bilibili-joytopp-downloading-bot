@@ -26,7 +26,7 @@ import sys
 # Google API imports (installed in workflow)
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload, ResumableMedia, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 
 # ---------- Config ----------
 BILIBILI_CHANNEL_URL = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
