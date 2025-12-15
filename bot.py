@@ -541,8 +541,8 @@ def main():
                     pass
                 continue
 
-            # Upload to YouTube (NO DESCRIPTION, NO SOURCE LINK)
-                try:
+           # Upload to YouTube (NO DESCRIPTION, NO SOURCE LINK)
+try:
     clean_title = final_title.strip()
     if not clean_title:
         clean_title = vid  # hard safety fallback
@@ -555,6 +555,7 @@ def main():
         privacy=YOUTUBE_PRIVACY_STATUS,
         category_id=YOUTUBE_CATEGORY_ID
     )
+
 except Exception as e:
     print("Video upload failed:", e)
     try:
@@ -567,7 +568,7 @@ except Exception as e:
         print("Reached skip limit after upload failure; stopping further processing.")
         break
     continue
-    
+
             # Set thumbnail if present
             if thumb_local and os.path.exists(thumb_local):
                 try:
