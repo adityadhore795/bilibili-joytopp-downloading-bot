@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Final bot.py — Bilibili -> YouTube uploader (robust, safe, beginner-friendly)
+Final bot.py — Bilibili -> YouTube uploader (robust, safe, copy-paste ready)
 
-Notes:
 - Downloads best available video (bestvideo+bestaudio/best) and merges to mp4.
 - Retries downloads up to DOWNLOAD_RETRIES times, then skips.
-- Will attempt up to MAX_VIDEOS successful uploads, and stop if SKIP_LIMIT skipped videos encountered.
+- Attempts up to MAX_VIDEOS successful uploads, stops if SKIP_LIMIT skipped videos encountered.
 - Translates titles via free translators (googletrans / deep-translator / unidecode) with caching.
 - Uses token.json (uploaded to repo) or env YOUTUBE_TOKEN_JSON to authenticate to YouTube.
 - Uploads with EMPTY description (no source link).
 - Sets thumbnail.jpg (if available) after a successful upload.
-- Guards against UnboundLocalError by only using video_id when upload succeeded.
+- Improved resumable uploader with progress prints, larger chunk size and backoff retries.
 """
 
 import os
@@ -30,6 +29,7 @@ import requests
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # ---------- Config (from env) ----------
 BILIBILI_CHANNEL_URL = os.getenv("BILIBILI_CHANNEL_URL", "https://space.bilibili.com/87877349/video")
@@ -58,7 +58,7 @@ TOKEN_PATH = REPO_PATH / "token.json"
 # Media extensions that count
 MEDIA_EXTS = (".mp4", ".mkv", ".m4a", ".webm", ".flv", ".ts", ".mov", ".avi", ".mp3", ".aac")
 
-# YouTube scopes (not used directly here, token must already have these)
+# YouTube scopes (token must already include these)
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 # ---------- Utilities ----------
@@ -78,11 +78,8 @@ def sanitize_title_for_youtube(s: str, max_len=100) -> str:
     if not s:
         return ""
     s = s.strip()
-    # remove control characters
     s = re.sub(r"[\x00-\x1f\x7f]", "", s)
-    # collapse whitespace
     s = re.sub(r"\s+", " ", s)
-    # trim
     s = s[:max_len]
     return s
 
@@ -100,7 +97,6 @@ def save_json_obj(path: Path, obj):
 def save_downloaded_ids_and_commit(path: Path, ids_set, github_token: Optional[str] = None):
     save_json_obj(path, sorted(list(ids_set)))
     print(f"Saved {len(ids_set)} IDs to {path}")
-    # optional push: if GITHUB_TOKEN present in env, attempt to commit & push
     gh = github_token or os.getenv("GITHUB_TOKEN")
     if not gh:
         return
@@ -228,7 +224,6 @@ def translate_title_for_vid(vid: str, original_title: str, translations_cache: d
     if last_success:
         translations_cache[vid] = last_success
         return last_success
-    # fallback file
     try:
         if FALLBACK_TITLE_PATH.exists():
             fallback = FALLBACK_TITLE_PATH.read_text(encoding="utf-8").strip()
@@ -345,6 +340,7 @@ def get_youtube_service():
 def youtube_upload_video(service, file_path, title, description, privacy="public", category_id="22"):
     """
     Uploads video via resumable upload. Returns the uploaded YouTube videoId or raises.
+    Improved: larger chunk, progress prints, exponential backoff on transient errors.
     """
     body = {
         "snippet": {
@@ -357,26 +353,60 @@ def youtube_upload_video(service, file_path, title, description, privacy="public
         }
     }
 
-    media = MediaFileUpload(file_path, chunksize=256 * 1024, resumable=True, mimetype="video/*")
+    CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
+    media = MediaFileUpload(file_path, chunksize=CHUNK_SIZE, resumable=True, mimetype="video/mp4")
     request = service.videos().insert(part="snippet,status", body=body, media_body=media)
 
     response = None
     retry = 0
-    MAX_RETRIES = 10
+    MAX_RETRIES = 12
     while response is None:
         try:
+            print("Initiating resumable upload to YouTube...")
             status, response = request.next_chunk()
+            if status:
+                try:
+                    prog = getattr(status, "progress", lambda: None)()
+                    if prog is None:
+                        prog = getattr(status, "resumable_progress", None)
+                    if prog is not None:
+                        try:
+                            percent = int(prog * 100)
+                            print(f"Upload progress: {percent}%")
+                        except Exception:
+                            print("Upload progressing...")
+                    else:
+                        print("Upload progressing...")
+                except Exception:
+                    print("Upload progressing...")
             if response:
                 if "id" in response:
+                    print("Upload completed, video ID:", response["id"])
                     return response["id"]
                 else:
                     raise Exception("Upload finished but no video id returned: " + str(response))
-        except Exception as e:
+        except HttpError as e:
             retry += 1
+            status_code = None
+            try:
+                status_code = e.resp.status
+            except Exception:
+                pass
+            print(f"HttpError during upload (attempt {retry}):", e)
+            if status_code and 400 <= status_code < 500 and status_code not in (429, 408):
+                raise
             if retry > MAX_RETRIES:
                 raise
-            sleep_seconds = random.uniform(2 ** retry, 2 ** retry + 2)
-            print(f"Upload error, retry {retry}/{MAX_RETRIES}, sleeping {sleep_seconds:.1f}s: {e}")
+            sleep_seconds = min(600, (2 ** retry) + random.uniform(0, 3))
+            print(f"Sleeping {sleep_seconds:.1f}s before retrying upload...")
+            time.sleep(sleep_seconds)
+        except Exception as e:
+            retry += 1
+            print(f"Upload error (attempt {retry}): {e}")
+            if retry > MAX_RETRIES:
+                raise
+            sleep_seconds = min(600, (2 ** retry) + random.uniform(0, 3))
+            print(f"Sleeping {sleep_seconds:.1f}s before retrying upload...")
             time.sleep(sleep_seconds)
 
 def youtube_set_thumbnail(service, video_id: str, thumbnail_path: str):
@@ -396,7 +426,6 @@ def main():
         cookies_path.write_text(BILIBILI_COOKIES_ENV, encoding="utf-8")
         print("Wrote cookies to", cookies_path)
 
-    # ensure git identity early (so commits don't error)
     if os.getenv("GITHUB_TOKEN"):
         try:
             subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
@@ -404,12 +433,10 @@ def main():
         except Exception:
             pass
 
-    # ffmpeg check
     has_ffmpeg = shutil.which("ffmpeg") is not None
     if not has_ffmpeg:
         print("Warning: ffmpeg not found. Merging may fail or produce audio-only files.")
 
-    # youtube service
     try:
         yt_service = get_youtube_service()
     except Exception as e:
@@ -469,7 +496,6 @@ def main():
         webpage = cand["webpage_url"]
         print(f"Processing candidate {vid} ({idx}/{len(candidates)})")
 
-        # fetch metadata
         meta_json = None
         try:
             meta_cmd = ["yt-dlp", "-j", "--no-warnings", "--no-progress", "--user-agent", BOT_USER_AGENT]
@@ -488,7 +514,6 @@ def main():
         safe_name = sanitize_filename_keep_unicode(final_title or vid)
         print(f"Title -> '{orig_title}' -> Translated -> '{final_title}' -> Filename -> '{safe_name}'")
 
-        # thumbnail
         thumb_local = None
         thumb_url = meta_json.get("thumbnail") if meta_json else None
         if thumb_url:
@@ -503,7 +528,6 @@ def main():
                 print("Thumbnail download failed:", e)
                 thumb_local = None
 
-        # download with retries
         download_ok = False
         attempt = 0
         downloaded_file = None
@@ -554,7 +578,6 @@ def main():
                 pass
             continue
 
-        # upload
         video_id = None
         try:
             yt_title = sanitize_title_for_youtube(final_title) or vid
@@ -580,7 +603,6 @@ def main():
                 break
             continue
 
-        # if upload succeeded, set thumbnail and record
         if video_id:
             try:
                 if thumb_local and os.path.exists(thumb_local):
@@ -599,7 +621,6 @@ def main():
             save_downloaded_ids_and_commit(DOWNLOADED_IDS_PATH, downloaded_ids, github_token=github_token)
             save_translations_and_commit(TRANSLATIONS_PATH, translations_cache, github_token=github_token)
 
-            # cleanup local video
             try:
                 os.remove(downloaded_file)
             except Exception:
@@ -608,7 +629,6 @@ def main():
             successes += 1
             print(f"Successfully processed {vid} -> YouTube ID {video_id}. Total successes this run: {successes}/{MAX_VIDEOS}")
         else:
-            # safety: if upload function didn't return video id, treat as skipped
             print(f"Upload did not return a video_id for {vid}; skipping finalization.")
             try:
                 if downloaded_file and os.path.exists(downloaded_file):
@@ -620,12 +640,10 @@ def main():
                 print("Reached skip limit; stopping.")
                 break
 
-        # polite pause
         time.sleep(random.uniform(1.0, 2.0))
 
     print(f"Run finished: {successes} successful uploads, {skips} skipped videos.")
 
-    # cleanup tokens if created from env
     try:
         if BILIBILI_COOKIES_ENV:
             p = REPO_PATH / "cookies.txt"
