@@ -593,7 +593,10 @@ def main():
                 pass
 
             successes += 1
-            print(f"Successfully processed {vid} -> YouTube ID {video_id}. Total successes this run: {successes}/{MAX_VIDEOS}")
+            if video_id:
+                print(f"Successfully processed {vid} -> YouTube ID {video_id}. Total successes this run: {successes}/{MAX_VIDEOS}")
+            else:
+                print(f"Upload failed for {vid}; no video_id returned, skipping success log.")
             time.sleep(random.uniform(1.0, 2.0))
 
         print(f"Run finished: {successes} successful uploads, {skips} skipped videos.")
