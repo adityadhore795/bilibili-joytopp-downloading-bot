@@ -542,6 +542,7 @@ def main():
                 continue
 
                 # Upload to YouTube (NO DESCRIPTION, NO SOURCE LINK)
+                video_id = None
                 try:
                     clean_title = final_title.strip()
                     if not clean_title:
