@@ -541,9 +541,8 @@ def main():
                     pass
                 continue
 
-            # Upload to YouTube
-           # Upload to YouTube (NO DESCRIPTION, NO SOURCE LINK)
-           try:
+            # Upload to YouTube (NO DESCRIPTION, NO SOURCE LINK)
+try:
     clean_title = final_title.strip()
     if not clean_title:
         clean_title = vid  # hard safety fallback
