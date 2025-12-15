@@ -542,21 +542,32 @@ def main():
                 continue
 
             # Upload to YouTube
-            try:
-                description = f"{YOUTUBE_DESCRIPTION}\n\nOriginal: {webpage}"
-                video_id = youtube_upload_video(yt_service, downloaded_file, final_title, description, privacy=YOUTUBE_PRIVACY_STATUS, category_id=YOUTUBE_CATEGORY_ID)
-            except Exception as e:
-                print("Video upload failed:", e)
-                try:
-                    os.remove(downloaded_file)
-                except Exception:
-                    pass
-                skips += 1
-                print(f"Skipping video {vid} due to upload failure. Skips so far: {skips}/{SKIP_LIMIT}")
-                if skips >= SKIP_LIMIT:
-                    print("Reached skip limit after upload failure; stopping further processing.")
-                    break
-                continue
+           # Upload to YouTube (NO DESCRIPTION, NO SOURCE LINK)
+           try:
+    clean_title = final_title.strip()
+    if not clean_title:
+        clean_title = vid  # hard safety fallback
+
+    video_id = youtube_upload_video(
+        yt_service,
+        downloaded_file,
+        clean_title,
+        "",  # 🔒 EMPTY DESCRIPTION
+        privacy=YOUTUBE_PRIVACY_STATUS,
+        category_id=YOUTUBE_CATEGORY_ID
+    )
+except Exception as e:
+    print("Video upload failed:", e)
+    try:
+        os.remove(downloaded_file)
+    except Exception:
+        pass
+    skips += 1
+    print(f"Skipping video {vid} due to upload failure. Skips so far: {skips}/{SKIP_LIMIT}")
+    if skips >= SKIP_LIMIT:
+        print("Reached skip limit after upload failure; stopping further processing.")
+        break
+    continue
 
             # Set thumbnail if present
             if thumb_local and os.path.exists(thumb_local):
