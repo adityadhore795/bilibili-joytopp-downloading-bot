@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Final bot.py — Bilibili -> YouTube uploader (robust, safe, copy-paste ready)
+Automated bot.py — Bilibili -> YouTube (copy-paste ready)
 
-- Downloads best available video (bestvideo+bestaudio/best) and merges to mp4.
-- Retries downloads up to DOWNLOAD_RETRIES times, then skips.
-- Attempts up to MAX_VIDEOS successful uploads, stops if SKIP_LIMIT skipped videos encountered.
-- Translates titles via free translators (googletrans / deep-translator / unidecode) with caching.
-- Uses token.json (uploaded to repo) or env YOUTUBE_TOKEN_JSON to authenticate to YouTube.
-- Uploads with EMPTY description (no source link).
-- Sets thumbnail.jpg (if available) after a successful upload.
-- Improved resumable uploader with progress prints, larger chunk size and backoff retries.
+Behavior:
+- Downloads videos from a specified Bilibili channel (one-by-one, skipping already-downloaded).
+- Attempts to download the best available quality at or above a minimum height (default 480p).
+- Retries downloads; skips after configured retries.
+- Uploads to YouTube as UNLISTED initially, waits for a configured period, then sets to PUBLIC.
+- Translations, thumbnails, chunked upload, token-from-secret usage, GitHub persistence of downloaded IDs and translations included.
+- DOES NOT remove watermarks. (Watermark left as-is.)
+- Fully automatic once you have added YOUTUBE_TOKEN_JSON to repo secrets and other required secrets.
 """
 
 import os
@@ -40,13 +40,20 @@ BOT_USER_AGENT = os.getenv("BOT_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win6
 # YouTube / token handling
 YOUTUBE_TOKEN_ENV = os.getenv("YOUTUBE_TOKEN_JSON")  # full token.json content, optional
 YOUTUBE_CLIENT_SECRETS_PATH = os.getenv("YOUTUBE_CLIENT_SECRET_PATH", "client_secret.json")
-YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "public")  # public / unlisted / private
+YOUTUBE_PRIVACY_STATUS_INITIAL = os.getenv("YOUTUBE_PRIVACY_STATUS", "unlisted")  # we will upload unlisted then change to public
+YOUTUBE_PRIVACY_STATUS_FINAL = os.getenv("YOUTUBE_PRIVACY_STATUS_FINAL", "public")
 YOUTUBE_CATEGORY_ID = os.getenv("YOUTUBE_CATEGORY_ID", "22")
 YOUTUBE_DESCRIPTION = ""  # always empty by design per user's choice
 
 # Retry/skip settings
 DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 SKIP_LIMIT = int(os.getenv("SKIP_LIMIT", "5"))
+
+# Quality enforcement: minimum height in pixels (user chose at least 480p)
+MIN_HEIGHT = int(os.getenv("MIN_HEIGHT", "480"))  # 480 means allow 480p and above
+
+# Delay before making video public (seconds). Example default 1800 = 30 minutes.
+PUBLISH_DELAY_SECONDS = int(os.getenv("PUBLISH_DELAY_SECONDS", "1800"))
 
 # Repo paths
 REPO_PATH = Path.cwd()
@@ -59,7 +66,7 @@ TOKEN_PATH = REPO_PATH / "token.json"
 MEDIA_EXTS = (".mp4", ".mkv", ".m4a", ".webm", ".flv", ".ts", ".mov", ".avi", ".mp3", ".aac")
 
 # YouTube scopes (token must already include these)
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube"]
 
 # ---------- Utilities ----------
 def sanitize_filename_keep_unicode(s: str, max_length=140) -> str:
@@ -337,7 +344,7 @@ def get_youtube_service():
     service = build("youtube", "v3", credentials=creds, cache_discovery=False)
     return service
 
-def youtube_upload_video(service, file_path, title, description, privacy="public", category_id="22"):
+def youtube_upload_video(service, file_path, title, description, privacy="unlisted", category_id="22"):
     """
     Uploads video via resumable upload. Returns the uploaded YouTube videoId or raises.
     Improved: larger chunk, progress prints, exponential backoff on transient errors.
@@ -418,6 +425,64 @@ def youtube_set_thumbnail(service, video_id: str, thumbnail_path: str):
     except Exception as e:
         print("Thumbnail set failed:", e)
 
+def youtube_set_privacy(service, video_id: str, privacy_status: str):
+    try:
+        body = {"id": video_id, "status": {"privacyStatus": privacy_status}}
+        req = service.videos().update(part="status", body=body)
+        resp = req.execute()
+        print(f"Set privacy -> {privacy_status} for video {video_id}")
+        return True
+    except Exception as e:
+        print("Failed to set privacy:", e)
+        return False
+
+# ---------- Quality selection helpers ----------
+def build_quality_thresholds(min_height: int):
+    # descending list of heights commonly used
+    preferred = [2160, 1440, 1080, 720, 480]
+    return [h for h in preferred if h >= min_height]
+
+def attempt_download_with_quality(webpage, safe_name, cookies_path, quality_height):
+    """
+    Try to download with a format that requests video height >= quality_height.
+    Returns downloaded_file path on success, else None.
+    """
+    format_expr = f"bestvideo[height>={quality_height}]+bestaudio/best"
+    print(f"Trying quality >= {quality_height} with format '{format_expr}'")
+    out_template = f"{safe_name}.%(ext)s"
+
+    dl_cmd = [
+        "yt-dlp",
+        "-f", format_expr,
+        "--merge-output-format", "mp4",
+        "-o", out_template,
+        "--no-warnings",
+        "--no-progress",
+        "--user-agent", BOT_USER_AGENT,
+        "--no-playlist",
+    ]
+    if cookies_path:
+        dl_cmd += ["--cookies", str(cookies_path)]
+    dl_cmd += [webpage]
+
+    try:
+        dl_proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stderr_snip = (dl_proc.stderr or "").strip()
+        if stderr_snip:
+            print("yt-dlp stderr:", stderr_snip[:2000])
+    except Exception as e:
+        print("yt-dlp failed to start:", e)
+        return None
+
+    downloaded_file = find_downloaded_file_by_prefix(safe_name)
+    if downloaded_file and os.path.getsize(downloaded_file) > 100:
+        print(f"Downloaded file found for quality {quality_height}: {downloaded_file}")
+        return downloaded_file
+    else:
+        remove_partial_files(safe_name)
+        print(f"No valid download at quality {quality_height}")
+        return None
+
 # ---------- Main ----------
 def main():
     cookies_path = None
@@ -426,6 +491,7 @@ def main():
         cookies_path.write_text(BILIBILI_COOKIES_ENV, encoding="utf-8")
         print("Wrote cookies to", cookies_path)
 
+    # git identity for commits (best-effort)
     if os.getenv("GITHUB_TOKEN"):
         try:
             subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
@@ -433,10 +499,12 @@ def main():
         except Exception:
             pass
 
+    # ffmpeg check
     has_ffmpeg = shutil.which("ffmpeg") is not None
     if not has_ffmpeg:
         print("Warning: ffmpeg not found. Merging may fail or produce audio-only files.")
 
+    # YouTube service
     try:
         yt_service = get_youtube_service()
     except Exception as e:
@@ -489,6 +557,11 @@ def main():
     idx = 0
     github_token = os.getenv("GITHUB_TOKEN")
 
+    # build thresholds descending while respecting MIN_HEIGHT
+    thresholds = build_quality_thresholds(MIN_HEIGHT)
+    if not thresholds:
+        thresholds = [MIN_HEIGHT]
+
     while successes < MAX_VIDEOS and idx < len(candidates) and skips < SKIP_LIMIT:
         cand = candidates[idx]
         idx += 1
@@ -496,6 +569,7 @@ def main():
         webpage = cand["webpage_url"]
         print(f"Processing candidate {vid} ({idx}/{len(candidates)})")
 
+        # fetch metadata
         meta_json = None
         try:
             meta_cmd = ["yt-dlp", "-j", "--no-warnings", "--no-progress", "--user-agent", BOT_USER_AGENT]
@@ -514,6 +588,7 @@ def main():
         safe_name = sanitize_filename_keep_unicode(final_title or vid)
         print(f"Title -> '{orig_title}' -> Translated -> '{final_title}' -> Filename -> '{safe_name}'")
 
+        # thumbnail
         thumb_local = None
         thumb_url = meta_json.get("thumbnail") if meta_json else None
         if thumb_url:
@@ -528,49 +603,34 @@ def main():
                 print("Thumbnail download failed:", e)
                 thumb_local = None
 
-        download_ok = False
-        attempt = 0
+        # Download with quality ladder and retries
         downloaded_file = None
-        while attempt < DOWNLOAD_RETRIES and not download_ok:
-            attempt += 1
-            print(f"Download attempt {attempt}/{DOWNLOAD_RETRIES} for {vid}")
-            out_template = f"{safe_name}.%(ext)s"
-            dl_cmd = [
-                "yt-dlp",
-                "-f", "bestvideo+bestaudio/best",
-                "--merge-output-format", "mp4",
-                "-o", out_template,
-                "--no-warnings",
-                "--no-progress",
-                "--user-agent", BOT_USER_AGENT,
-                "--no-playlist",
-            ]
-            if cookies_path:
-                dl_cmd += ["--cookies", str(cookies_path)]
-            dl_cmd += [webpage]
-
-            dl_proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stderr_snip = (dl_proc.stderr or "").strip()[:2000]
-            if stderr_snip:
-                print("yt-dlp stderr (short):", stderr_snip)
-
-            downloaded_file = find_downloaded_file_by_prefix(safe_name)
-            if downloaded_file and os.path.getsize(downloaded_file) > 100:
-                print("Downloaded file located:", downloaded_file)
-                download_ok = True
+        download_ok = False
+        for quality in thresholds:
+            # try each quality; for each quality allow DOWNLOAD_RETRIES attempts
+            attempts_for_quality = 0
+            while attempts_for_quality < DOWNLOAD_RETRIES and not download_ok:
+                attempts_for_quality += 1
+                print(f"Attempt {attempts_for_quality}/{DOWNLOAD_RETRIES} for quality >= {quality} for vid {vid}")
+                q_file = attempt_download_with_quality(webpage, safe_name, cookies_path, quality)
+                if q_file:
+                    downloaded_file = q_file
+                    download_ok = True
+                    break
+                else:
+                    if attempts_for_quality < DOWNLOAD_RETRIES:
+                        sleep_for = random.uniform(4.0, 12.0)
+                        print(f"Quality {quality} not available/failed; waiting {sleep_for:.1f}s before retrying same quality.")
+                        time.sleep(sleep_for)
+            if download_ok:
+                print(f"Downloaded at quality >= {quality}")
                 break
             else:
-                remove_partial_files(safe_name)
-                if attempt < DOWNLOAD_RETRIES:
-                    sleep_for = random.uniform(5.0, 12.0)
-                    print(f"Download failed for {vid} on attempt {attempt}. Waiting {sleep_for:.1f}s before retry.")
-                    time.sleep(sleep_for)
-                else:
-                    print(f"Download failed for {vid} after {DOWNLOAD_RETRIES} attempts; will skip this video.")
+                print(f"Falling back to next lower quality (if any).")
 
         if not download_ok:
             skips += 1
-            print(f"Skipping video {vid}. Skips so far this run: {skips}/{SKIP_LIMIT}")
+            print(f"Skipping video {vid} because minimum quality {MIN_HEIGHT} not met or download failed. Skips: {skips}/{SKIP_LIMIT}")
             try:
                 if thumb_local and os.path.exists(thumb_local):
                     os.remove(thumb_local)
@@ -578,6 +638,7 @@ def main():
                 pass
             continue
 
+        # Upload to YouTube as unlisted initially
         video_id = None
         try:
             yt_title = sanitize_title_for_youtube(final_title) or vid
@@ -587,7 +648,7 @@ def main():
                 downloaded_file,
                 yt_title,
                 "",  # empty description
-                privacy=YOUTUBE_PRIVACY_STATUS,
+                privacy=YOUTUBE_PRIVACY_STATUS_INITIAL,
                 category_id=YOUTUBE_CATEGORY_ID
             )
         except Exception as e:
@@ -603,6 +664,7 @@ def main():
                 break
             continue
 
+        # If upload succeeded, set thumbnail, persist, and schedule publish
         if video_id:
             try:
                 if thumb_local and os.path.exists(thumb_local):
@@ -621,13 +683,34 @@ def main():
             save_downloaded_ids_and_commit(DOWNLOADED_IDS_PATH, downloaded_ids, github_token=github_token)
             save_translations_and_commit(TRANSLATIONS_PATH, translations_cache, github_token=github_token)
 
+            # cleanup local video file after upload
             try:
                 os.remove(downloaded_file)
             except Exception:
                 pass
 
             successes += 1
-            print(f"Successfully processed {vid} -> YouTube ID {video_id}. Total successes this run: {successes}/{MAX_VIDEOS}")
+            print(f"Uploaded {vid} as unlisted -> YouTube ID {video_id}. Successes: {successes}/{MAX_VIDEOS}")
+
+            # Wait a short time for processing to start (polling not reliable for Content ID)
+            wait_seconds = PUBLISH_DELAY_SECONDS
+            print(f"Waiting {wait_seconds} seconds before making video public (or final privacy change).")
+            elapsed = 0
+            step = 15
+            while elapsed < wait_seconds:
+                time.sleep(step)
+                elapsed += step
+                # print a heartbeat every few iterations to keep logs alive
+                if elapsed % 120 == 0:
+                    print(f"Waiting... {elapsed}/{wait_seconds} seconds elapsed.")
+
+            # After wait, change privacy to final (public)
+            success_priv = youtube_set_privacy(yt_service, video_id, YOUTUBE_PRIVACY_STATUS_FINAL)
+            if success_priv:
+                print(f"Video {video_id} privacy set to {YOUTUBE_PRIVACY_STATUS_FINAL}.")
+            else:
+                print(f"Failed to change privacy for {video_id}; leaving as {YOUTUBE_PRIVACY_STATUS_INITIAL}.")
+
         else:
             print(f"Upload did not return a video_id for {vid}; skipping finalization.")
             try:
@@ -640,10 +723,12 @@ def main():
                 print("Reached skip limit; stopping.")
                 break
 
+        # polite pause
         time.sleep(random.uniform(1.0, 2.0))
 
     print(f"Run finished: {successes} successful uploads, {skips} skipped videos.")
 
+    # cleanup cookies file if created from env
     try:
         if BILIBILI_COOKIES_ENV:
             p = REPO_PATH / "cookies.txt"
